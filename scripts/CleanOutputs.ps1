@@ -1,10 +1,9 @@
 
 . "$PSScriptRoot\CommonUtils.ps1"
 
-remove-item "$emitterDir\*.generated.rsp"
-remove-item "$scraperDir\*.generated.rsp"
+dotnet clean "$windowsWin32ProjectRoot"
 
-Remove-Directory "$emitterDir\obj"
-Remove-Directory "$scraperDir\obj"
-Remove-Directory $sdkGeneratedSourceDir
-Remove-Directory $binDir
+if (Test-Path "$rootDir\obj")
+{
+    remove-item "$rootDir\obj" -force -recurse
+}

@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -11,54 +12,138 @@ namespace ClangSharpSourceToWinmd
 {
     public static class MetadataSyntaxTreeCleaner
     {
-        public static SyntaxTree CleanSyntaxTree(SyntaxTree tree, Dictionary<string, string> remaps, Dictionary<string, Dictionary<string, string>> enumAdditions, HashSet<string> enumsMakeFlags, Dictionary<string, string> requiredNamespaces, HashSet<string> nonEmptyStructs, HashSet<string> enumMemberNames, string filePath)
+        public static SyntaxTree CleanSyntaxTree(SyntaxTree tree, Dictionary<string, string> remaps, Dictionary<string, Dictionary<string, string>> enumAdditions, HashSet<string> enumsMakeFlags, Dictionary<string, string> requiredNamespaces, Dictionary<string, string> staticLibs, HashSet<string> nonEmptyStructs, HashSet<string> enumMemberNames, string filePath)
         {
-            TreeRewriter treeRewriter = new TreeRewriter(remaps, enumAdditions, enumsMakeFlags, requiredNamespaces, nonEmptyStructs, enumMemberNames);
+            TreeRewriter treeRewriter = new TreeRewriter(remaps, enumAdditions, enumsMakeFlags, requiredNamespaces, staticLibs, nonEmptyStructs, enumMemberNames);
             var newRoot = (CSharpSyntaxNode)treeRewriter.Visit(tree.GetRoot());
-            return CSharpSyntaxTree.Create(newRoot, null, filePath);
+            var ret = CSharpSyntaxTree.Create(newRoot, null, filePath);
+            return ret;
         }
 
         private class TreeRewriter : CSharpSyntaxRewriter
         {
-            private static readonly System.Text.RegularExpressions.Regex elementCountRegex = new System.Text.RegularExpressions.Regex(@"(?:elementCount|byteCount)\(([^\)]+)\)");
+            private static readonly Regex ElementCountRegex = new Regex(@"(?:elementCount|byteCount)\(([^\)]+)\)");
+            private static readonly Regex IsRegex = new Regex(@"[^\w::]");
 
             private HashSet<SyntaxNode> nodesWithMarshalAs = new HashSet<SyntaxNode>();
             private Dictionary<string, string> remaps;
+            private Dictionary<Regex, string> regexRemaps = new Dictionary<Regex, string>();
             private Dictionary<string, Dictionary<string, string>> enumAdditions;
             private Dictionary<string, string> requiredNamespaces;
+            private Dictionary<string, string> staticLibs;
             private HashSet<string> visitedDelegateNames = new HashSet<string>();
             private HashSet<string> visitedStaticMethodNames = new HashSet<string>();
             private HashSet<string> nonEmptyStructs;
             private HashSet<string> enumMemberNames;
             private HashSet<string> enumsToMakeFlags;
+            private HashSet<string> usingNamespaces = new HashSet<string>();
 
-            public TreeRewriter(Dictionary<string, string> remaps, Dictionary<string, Dictionary<string, string>> enumAdditions, HashSet<string> enumsToMakeFlags, Dictionary<string, string> requiredNamespaces, HashSet<string> nonEmptyStructs, HashSet<string> enumMemberNames)
+            public TreeRewriter(Dictionary<string, string> remaps, Dictionary<string, Dictionary<string, string>> enumAdditions, HashSet<string> enumsToMakeFlags, Dictionary<string, string> requiredNamespaces, Dictionary<string, string> staticLibs, HashSet<string> nonEmptyStructs, HashSet<string> enumMemberNames)
             {
                 this.remaps = remaps;
+                this.InitRegexRemaps();
+
                 this.enumAdditions = enumAdditions;
                 this.requiredNamespaces = requiredNamespaces;
+                this.staticLibs = staticLibs;
                 this.nonEmptyStructs = nonEmptyStructs;
                 this.enumMemberNames = enumMemberNames;
                 this.enumsToMakeFlags = enumsToMakeFlags;
+            }
+
+            private void InitRegexRemaps()
+            {
+                foreach (var pair in this.remaps)
+                {
+                    if (IsRegex.IsMatch(pair.Key))
+                    {
+                        this.regexRemaps[new Regex(pair.Key)] = pair.Value;
+                    }
+                }
+            }
+
+            public override SyntaxNode VisitCompilationUnit(CompilationUnitSyntax node)
+            {
+                var ret = (CompilationUnitSyntax)base.VisitCompilationUnit(node);
+
+                // Add any namespaces we might need due to remappings
+                var newUsings = new List<UsingDirectiveSyntax>();
+                foreach (var remapNamespace in this.requiredNamespaces.Values.Distinct())
+                {
+                    if (!this.usingNamespaces.Contains(remapNamespace))
+                    {
+                        newUsings.Add(SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(remapNamespace)).NormalizeWhitespace().WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed));
+                    }
+                }
+
+                if (newUsings.Count != 0)
+                {
+                    ret = ret.AddUsings(newUsings.ToArray());
+                }
+
+                return ret;
+            }
+
+            public override SyntaxNode VisitUsingDirective(UsingDirectiveSyntax node)
+            {
+                this.usingNamespaces.Add(node.Name.ToString());
+                return base.VisitUsingDirective(node);
+            }
+
+            private static SyntaxList<AttributeListSyntax> FixRemappedAttributes(
+                SyntaxList<AttributeListSyntax> existingAttrList,
+                List<AttributeSyntax> remappedListAttributes)
+            {
+                return FixRemappedAttributes(existingAttrList, remappedListAttributes, null);
+            }
+
+            private static SyntaxList<AttributeListSyntax> FixRemappedAttributes(
+                SyntaxList<AttributeListSyntax> existingAttrList,
+                List<AttributeSyntax> remappedListAttributes,
+                AttributeTargetSpecifierSyntax target)
+            {
+                if (remappedListAttributes == null)
+                {
+                    return existingAttrList;
+                }
+
+                foreach (var attrNode in remappedListAttributes)
+                {
+                    var attrName = attrNode.Name.ToString();
+                    if (attrName.EndsWith(EncodeHelpers.AttributeToRemoveSuffix))
+                    {
+                        var attrNameToRemove = attrName.Substring(0, attrName.Length - EncodeHelpers.AttributeToRemoveSuffix.Length);
+
+                        existingAttrList = SyntaxUtils.RemoveAttribute(existingAttrList, attrNameToRemove);
+                    }
+                    else
+                    {
+                        // Remove any existing attribute with the same name
+                        existingAttrList = SyntaxUtils.RemoveAttribute(existingAttrList, attrName);
+
+                        var attrListNode =
+                            SyntaxFactory.AttributeList(
+                                SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(attrNode));
+                        if (target != null)
+                        {
+                            attrListNode = attrListNode.WithTarget(target);
+                        }
+
+                        existingAttrList = existingAttrList.Add(attrListNode);
+                    }
+                }
+
+                return existingAttrList;
             }
 
             public override SyntaxNode VisitParameter(ParameterSyntax node)
             {
                 string fullName = GetFullNameWithoutArchSuffix(node);
 
-                if (this.GetRemapInfo(fullName, out List<AttributeSyntax> listAttributes, node.Type.ToString(), out string newType, out string newName))
+                if (this.GetRemapInfo(fullName, out var listAttributes, node.Type.ToString(), out string newType, out string newName))
                 {
                     node = (ParameterSyntax)base.VisitParameter(node);
-                    if (listAttributes != null)
-                    {
-                        foreach (var attrNode in listAttributes)
-                        {
-                            var attrListNode =
-                                SyntaxFactory.AttributeList(
-                                    SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(attrNode));
-                            node = node.WithAttributeLists(node.AttributeLists.Add(attrListNode));
-                        }
-                    }
+                    node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, listAttributes));
                         
                     if (newName != null)
                     {
@@ -73,7 +158,19 @@ namespace ClangSharpSourceToWinmd
                         var attr = SyntaxUtils.GetAttribute(node.AttributeLists, "NativeTypeName");
                         if (attr != null)
                         {
-                            node = node.RemoveNode(attr, SyntaxRemoveOptions.KeepLeadingTrivia);
+                            var attrList = (AttributeListSyntax)attr.Parent;
+
+                            // We want to delete the attribute, but if it's the last one in the list,
+                            // remove the list
+                            if (attrList.Attributes.Count == 1)
+                            {
+                                node = node.RemoveNode(attrList, SyntaxRemoveOptions.KeepLeadingTrivia);
+                            }
+                            // If it's not the last attribute, just remove the attribute
+                            else
+                            {
+                                node = node.RemoveNode(attr, SyntaxRemoveOptions.KeepLeadingTrivia);
+                            }
                         }
                     }
                 }
@@ -99,16 +196,35 @@ namespace ClangSharpSourceToWinmd
                     return null;
                 }
 
-                return base.VisitStructDeclaration(node);
+                string fullName = GetFullNameWithoutArchSuffix(node);
+                if (this.GetRemapInfo(fullName, out var listAttributes, null, out _, out string newName))
+                {
+                    node = (StructDeclarationSyntax)base.VisitStructDeclaration(node);
+                    node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, listAttributes));
+
+                    if (newName != null)
+                    {
+                        node = node.WithIdentifier(SyntaxFactory.Identifier(newName));
+                    }
+                }
+                else
+                {
+                    node = (StructDeclarationSyntax)base.VisitStructDeclaration(node);
+                }
+
+                return node;
             }
 
             public override SyntaxNode VisitFieldDeclaration(FieldDeclarationSyntax node)
             {
+                const string ForceConstPrefix = "__forceconst__";
+
+                string localName = node.Declaration.Variables.First().Identifier.ValueText;
+
                 // If it's a constant, ignore it if it's already part of an enum
                 if (node.Modifiers.ToString() == "public const")
                 {
-                    string name = node.Declaration.Variables.First().Identifier.ValueText;
-                    if (this.enumMemberNames.Contains(name))
+                    if (this.enumMemberNames.Contains(localName))
                     {
                         return null;
                     }
@@ -125,66 +241,70 @@ namespace ClangSharpSourceToWinmd
                     newType = "string";
                 }
 
-                // Turn public static readonly Guids into string constants with an attribute
-                // to signal language projections to turn them into Guid constants. Guid constants 
-                // aren't allowed in metadata, requiring us to surface them this way
-                if (node.Modifiers.ToString() == "public static readonly" && node.Declaration.Type.ToString() == "Guid")
+                if (node.Modifiers.ToString() == "public static readonly")
                 {
-                    Guid guidVal = Guid.Empty;
-                    var varInitializer = node.Declaration.Variables.First().Initializer;
-                    if (varInitializer.Value is ObjectCreationExpressionSyntax objCreationSyntax)
+                    // Turn public static readonly Guids into string constants with an attribute
+                    // to signal language projections to turn them into Guid constants. Guid constants 
+                    // aren't allowed in metadata, requiring us to surface them this way
+                    if (node.Declaration.Type.ToString() == "Guid")
                     {
-                        var args = objCreationSyntax.ArgumentList.Arguments;
-                        if (args.Count == 11)
+                        var varInitializer = node.Declaration.Variables.First().Initializer;
+                        if (varInitializer.Value is ObjectCreationExpressionSyntax objCreationSyntax)
                         {
-                            uint p0 = EncodeHelpers.ParseHex(args[0].ToString());
-                            ushort p1 = (ushort)EncodeHelpers.ParseHex(args[1].ToString());
-                            ushort p2 = (ushort)EncodeHelpers.ParseHex(args[2].ToString());
-                            byte p3 = (byte)EncodeHelpers.ParseHex(args[3].ToString());
-                            byte p4 = (byte)EncodeHelpers.ParseHex(args[4].ToString());
-                            byte p5 = (byte)EncodeHelpers.ParseHex(args[5].ToString());
-                            byte p6 = (byte)EncodeHelpers.ParseHex(args[6].ToString());
-                            byte p7 = (byte)EncodeHelpers.ParseHex(args[7].ToString());
-                            byte p8 = (byte)EncodeHelpers.ParseHex(args[8].ToString());
-                            byte p9 = (byte)EncodeHelpers.ParseHex(args[9].ToString());
-                            byte p10 = (byte)EncodeHelpers.ParseHex(args[10].ToString());
+                            node = node.RemoveNode(varInitializer, SyntaxRemoveOptions.KeepExteriorTrivia | SyntaxRemoveOptions.KeepEndOfLine);
 
-                            guidVal = new Guid(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10);
-                        }
-                        else if (objCreationSyntax.ArgumentList.Arguments.Count == 1)
-                        {
-                            var textValue = EncodeHelpers.RemoveQuotes(objCreationSyntax.ArgumentList.Arguments[0].ToString());
-
-                            // If this is an invalid format, remove the node
-                            if (!Guid.TryParse(textValue, out guidVal))
+                            var args = objCreationSyntax.ArgumentList.Arguments;
+                            if (args.Count == 11)
                             {
-                                return null;
+                                var allArgs = $"(uint){args}";
+
+                                string argsFormatted = $"({allArgs})";
+                                var attrsList =
+                                    SyntaxFactory.AttributeList(
+                                        SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(
+                                            SyntaxFactory.Attribute(
+                                                SyntaxFactory.ParseName("Windows.Win32.Interop.Guid"),
+                                                SyntaxFactory.ParseAttributeArgumentList(argsFormatted))));
+
+                                node = node.AddAttributeLists(attrsList).WithLeadingTrivia(node.GetLeadingTrivia());
+                            }
+                            else if (objCreationSyntax.ArgumentList.Arguments.Count == 1)
+                            {
+                                var textValue = EncodeHelpers.RemoveQuotes(objCreationSyntax.ArgumentList.Arguments[0].ToString());
+
+                                // If this is an invalid format, remove the node
+                                if (!Guid.TryParse(textValue, out var guidVal))
+                                {
+                                    return null;
+                                }
+
+                                node = node.AddAttributeLists(EncodeHelpers.ConvertGuidToAttributeList(guidVal).WithLeadingTrivia(node.GetLeadingTrivia()));
                             }
                         }
-                    }
 
-                    if (guidVal == Guid.Empty)
-                    {
                         return node;
                     }
+                    // Some constants get scraped as public static readonly.
+                    // If we see the prefix, force it to be a const
+                    else if (localName.StartsWith(ForceConstPrefix))
+                    {
+                        var newModifiers =
+                            SyntaxFactory.TokenList(
+                                SyntaxFactory.Token(SyntaxKind.PublicKeyword).WithTrailingTrivia(SyntaxFactory.Space),
+                                SyntaxFactory.Token(SyntaxKind.ConstKeyword).WithTrailingTrivia(SyntaxFactory.Space));
 
-                    node = node.RemoveNode(varInitializer, SyntaxRemoveOptions.KeepExteriorTrivia | SyntaxRemoveOptions.KeepEndOfLine);
-                    node = node.AddAttributeLists(EncodeHelpers.ConvertGuidToAttributeList(guidVal).WithLeadingTrivia(node.GetLeadingTrivia()));
+                        node = node.WithModifiers(newModifiers).WithLeadingTrivia(node.GetLeadingTrivia());
 
-                    return node;
+                        var variable = node.Declaration.Variables.First();
+                        variable = variable.WithIdentifier(SyntaxFactory.ParseToken(localName.Substring(ForceConstPrefix.Length)));
+                        node = node.WithDeclaration(node.Declaration.WithVariables(SyntaxFactory.SingletonSeparatedList(variable)));
+
+                        return node;
+                    }
                 }
 
                 node = (FieldDeclarationSyntax)base.VisitFieldDeclaration(node);
-                if (listAttributes != null)
-                {
-                    foreach (var attrNode in listAttributes)
-                    {
-                        var attrListNode =
-                            SyntaxFactory.AttributeList(
-                                SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(attrNode));
-                        node = node.WithAttributeLists(node.AttributeLists.Add(attrListNode));
-                    }
-                }
+                node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, listAttributes));
 
                 var firstVar = node.Declaration.Variables.First();
 
@@ -275,16 +395,7 @@ namespace ClangSharpSourceToWinmd
                 var enumName = node.Identifier.ValueText;
                 if (this.GetRemapInfo(enumName, out var listAttributes, null, out _, out _))
                 {
-                    if (listAttributes != null)
-                    {
-                        foreach (var attrNode in listAttributes)
-                        {
-                            var attrListNode =
-                                SyntaxFactory.AttributeList(
-                                    SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(attrNode));
-                            node = node.WithAttributeLists(node.AttributeLists.Add(attrListNode));
-                        }
-                    }
+                    node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, listAttributes));
                 }
 
                 if (this.enumAdditions.TryGetValue(enumName, out var additionsList))
@@ -312,7 +423,7 @@ namespace ClangSharpSourceToWinmd
                             node.AddAttributeLists(
                                 SyntaxFactory.AttributeList(
                                     SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(
-                                        SyntaxFactory.Attribute(SyntaxFactory.ParseName("Flags")))).WithLeadingTrivia(node.GetLeadingTrivia()));
+                                        SyntaxFactory.Attribute(SyntaxFactory.ParseName("global::System.Flags")))).WithLeadingTrivia(node.GetLeadingTrivia()));
                     }
 
                     if (node.BaseList == null)
@@ -345,23 +456,12 @@ namespace ClangSharpSourceToWinmd
                 string fixedName = GetFullNameWithoutArchSuffix(node);
                 string returnFullName = $"{fixedName}::return";
 
-                if (this.GetRemapInfo(returnFullName, out List<AttributeSyntax> listAttributes, node.ReturnType.ToString(), out var newType, out _))
+                if (this.GetRemapInfo(returnFullName, out var listAttributes, node.ReturnType.ToString(), out var newType, out _))
                 {
                     node = (DelegateDeclarationSyntax)base.VisitDelegateDeclaration(node);
-                    if (listAttributes != null)
-                    {
-                        foreach (var attrNode in listAttributes)
-                        {
-                            var attrListNode =
-                                SyntaxFactory.AttributeList(
-                                    SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(attrNode))
-                                    .WithTarget(
-                                        SyntaxFactory.AttributeTargetSpecifier(
-                                            SyntaxFactory.Token(SyntaxKind.ReturnKeyword)));
 
-                            node = node.WithAttributeLists(node.AttributeLists.Add(attrListNode));
-                        }
-                    }
+                    var target = SyntaxFactory.AttributeTargetSpecifier(SyntaxFactory.Token(SyntaxKind.ReturnKeyword));
+                    node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, listAttributes, target));
 
                     if (newType != null)
                     {
@@ -376,8 +476,14 @@ namespace ClangSharpSourceToWinmd
 
             public override SyntaxNode VisitMethodDeclaration(MethodDeclarationSyntax node)
             {
+                var dllImportAttr = SyntaxUtils.GetAttribute(node.AttributeLists, "DllImport");
+                string dllName = dllImportAttr?.ArgumentList.Arguments[0].ToString();
+
+                // Trim the leading and trailing quotes.
+                dllName = dllName?.Substring(1, dllName.Length - 2);
+
                 // Skip methods where we weren't given an import lib name. Should we warn the caller?
-                if (node.AttributeLists.ToString().Contains("[DllImport(\"\""))
+                if (dllImportAttr != null && string.IsNullOrEmpty(dllName))
                 {
                     return null;
                 }
@@ -415,35 +521,40 @@ namespace ClangSharpSourceToWinmd
                 }
 
                 string returnFullName = $"{fixedFullName}::return";
+                string nodeReturnType = node.ReturnType.ToString();
+
+                node = (MethodDeclarationSyntax)base.VisitMethodDeclaration(node);
+
+                // Add the StaticLibrary attribute if one was specified for this DLL.
+                if (!string.IsNullOrEmpty(dllName) && this.staticLibs.TryGetValue(dllName, out string staticLib))
+                {
+                    var attrListNode = SyntaxFactory.AttributeList(
+                        SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(
+                            SyntaxFactory.Attribute(SyntaxFactory.ParseName("StaticLibrary"),
+                            SyntaxFactory.ParseAttributeArgumentList($"(\"{staticLib}\")"))));
+
+                    node = node.WithAttributeLists(node.AttributeLists.Add(attrListNode));
+                }
+
+                // See if there are any attributes directly on the method
+                if (this.GetRemapInfo(fullName, out var methodAttributes, null, out _, out _))
+                {
+                    node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, methodAttributes));
+                }
 
                 // Find remap info for the return parameter for this method and apply any that we find
-                if (this.GetRemapInfo(returnFullName, out List<AttributeSyntax> listAttributes, node.ReturnType.ToString(), out var newType, out _))
+                if (this.GetRemapInfo(returnFullName, out var listAttributes, nodeReturnType, out var newType, out _))
                 {
-                    node = (MethodDeclarationSyntax)base.VisitMethodDeclaration(node);
-                    if (listAttributes != null)
-                    {
-                        foreach (var attrNode in listAttributes)
-                        {
-                            var attrListNode =
-                                SyntaxFactory.AttributeList(
-                                    SyntaxFactory.SingletonSeparatedList<AttributeSyntax>(attrNode))
-                                    .WithTarget(
-                                        SyntaxFactory.AttributeTargetSpecifier(
-                                            SyntaxFactory.Token(SyntaxKind.ReturnKeyword)));
-
-                            node = node.WithAttributeLists(node.AttributeLists.Add(attrListNode));
-                        }
-                    }
+                    var target = SyntaxFactory.AttributeTargetSpecifier(SyntaxFactory.Token(SyntaxKind.ReturnKeyword));
+                    node = node.WithAttributeLists(FixRemappedAttributes(node.AttributeLists, listAttributes, target));
 
                     if (newType != null)
                     {
                         node = node.WithReturnType(SyntaxFactory.ParseTypeName(newType).WithTrailingTrivia(SyntaxFactory.Space));
                     }
-
-                    return node;
                 }
 
-                return base.VisitMethodDeclaration(node);
+                return node;
             }
 
             private static string GetEnclosingNamespace(SyntaxNode node)
@@ -589,7 +700,7 @@ namespace ClangSharpSourceToWinmd
                     return;
                 }
 
-                var metadataType = GetInfoForNativeType(nativeTypeName, out bool isConst, out bool isNullTerminated, out bool isNullNullTerminated);
+                var metadataType = this.GetInfoForNativeType(nativeTypeName, out bool isConst, out bool isNullTerminated, out bool isNullNullTerminated);
 
                 if (isConst && !alreadyConst)
                 {
@@ -658,6 +769,7 @@ namespace ClangSharpSourceToWinmd
                 bool isIn = false;
                 bool isOut = false;
                 bool isOpt = false;
+                bool isReserved = false;
                 bool isComOutPtr = false;
                 bool isRetVal = false;
                 bool isNullNullTerminated;
@@ -684,12 +796,17 @@ namespace ClangSharpSourceToWinmd
                         else if (salAttr.P1.StartsWith("__RPC__"))
                         {
                             // TODO: Handle ecount, xcount and others that deal with counts
+                            bool deref = false;
 
                             string[] parts = salAttr.P1.Split('_');
                             foreach (var part in parts)
                             {
                                 switch (part)
                                 {
+                                    case "deref":
+                                        deref = true;
+                                        break;
+
                                     case "in":
                                         isIn = true;
                                         break;
@@ -703,12 +820,23 @@ namespace ClangSharpSourceToWinmd
                                         break;
 
                                     case "opt":
+                                        // As per rpcsal.h, deref_opt means input optional but deref_***_opt doesn't
+                                        if (deref && (isIn || isOut))
+                                        {
+                                            continue;
+                                        }
+
                                         isOpt = true;
                                         break;
                                 }
                             }
 
                             break;
+                        }
+                        else if (salAttr.P1 == "_Reserved_")
+                        {
+                            isReserved = true;
+                            continue;
                         }
                     }
 
@@ -814,6 +942,11 @@ namespace ClangSharpSourceToWinmd
                     attributesList.Add(SyntaxFactory.Attribute(SyntaxFactory.ParseName("Out")));
                 }
 
+                if (isReserved)
+                {
+                    attributesList.Add(SyntaxFactory.Attribute(SyntaxFactory.ParseName("Reserved")));
+                }
+
                 if (isOpt)
                 {
                     attributesList.Add(SyntaxFactory.Attribute(SyntaxFactory.ParseName("Optional")));
@@ -839,7 +972,7 @@ namespace ClangSharpSourceToWinmd
                 string GetArrayMarshalAsFromP1(ParameterSyntax paramNode, string p1Text)
                 {
                     ParameterListSyntax parameterListNode = (ParameterListSyntax)paramNode.Parent;
-                    var match = elementCountRegex.Match(p1Text);
+                    var match = ElementCountRegex.Match(p1Text);
                     StringBuilder ret = new StringBuilder("(");
 
                     if (match.Success)
@@ -912,6 +1045,29 @@ namespace ClangSharpSourceToWinmd
                 }
             }
 
+            private string GetRemapData(string fullName)
+            {
+                if (string.IsNullOrEmpty(fullName))
+                {
+                    return null;
+                }
+
+                if (this.remaps.TryGetValue(fullName, out var remapData))
+                {
+                    return remapData;
+                }
+
+                foreach (var pair in this.regexRemaps)
+                {
+                    if (pair.Key.IsMatch(fullName))
+                    {
+                        return pair.Value;
+                    }
+                }
+
+                return null;
+            }
+
             private bool GetRemapInfo(string fullName, out List<AttributeSyntax> listAttributes, string currentType, out string newType, out string newName)
             {
                 listAttributes = null;
@@ -919,8 +1075,8 @@ namespace ClangSharpSourceToWinmd
                 newName = null;
 
                 bool ret = false;
-
-                if (!string.IsNullOrEmpty(fullName) && this.remaps.TryGetValue(fullName, out string remapData))
+                string remapData = this.GetRemapData(fullName);
+                if (!string.IsNullOrEmpty(remapData))
                 {
                     ret = EncodeHelpers.DecodeRemap(remapData, out listAttributes, out newType, out newName);
                     if (newType != null)

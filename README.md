@@ -19,7 +19,9 @@ Note: Community projects are listed here to help with discovery but are not offi
 
 See the [roadmap](./docs/roadmap.md) and [FAQ](./docs/faq.md) for more details.
 
-If you'd like to browse the metadata to see what we're emitting, [download the NuGet package](https://www.nuget.org/packages/Microsoft.Windows.SDK.Win32Metadata/) and load the included winmd file in [ILSpy](https://github.com/icsharpcode/ILSpy).
+If you'd like to browse the metadata to see what we're emitting, download [Windows.Win32.winmd](https://github.com/microsoft/win32metadata/raw/master/scripts/BaselineWinmd/Windows.Win32.winmd) and [Windows.Win32.Interop.dll](https://github.com/microsoft/win32metadata/raw/master/scripts/BaselineWinmd/Windows.Win32.Interop.dll) into the same folder and load Windows.Win32.winmd in [ILSpy](https://github.com/icsharpcode/ILSpy/releases/latest).
+
+We also publish the metadata via the [Microsoft.Windows.SDK.Win32Metadata](https://www.nuget.org/packages/Microsoft.Windows.SDK.Win32Metadata/) NuGet package.
 
 ![ILSpy with winmd](./images/ILSpyWithWinmd.png)
 
@@ -46,7 +48,7 @@ ClangSharp emits C# as it encounters types found in C/C++ headers. It will only 
 
 Example for Direct3DDxgi:
 
-[generation/scraper/Partitions/Direct3DDxgi/main.cpp](generation/scraper/Partitions/Direct3DDxgi/main.cpp):
+[generation/WinSDK/Partitions/Direct3DDxgi/main.cpp](generation/WinSDK/Partitions/Direct3DDxgi/main.cpp):
 
     #include <winnt.h>
     #include <winerror.h>
@@ -61,7 +63,7 @@ Example for Direct3DDxgi:
     #include <dxgicommon.h>
     #include <dxgiformat.h>
 
-[generation/scraper/Partitions/Direct3DDxgi/settings.rsp](generation/scraper/Partitions/Direct3DDxgi/settings.rsp):
+[generation/WinSDK/Partitions/Direct3DDxgi/settings.rsp](generation/WinSDK/Partitions/Direct3DDxgi/settings.rsp):
 
     --traverse
     <IncludeRoot>/shared/dxgitype.h
@@ -100,7 +102,7 @@ It starts emitting:
 
 It has no way of knowing a typedef is coming (RECT). But, we can feed data into ClangSharp that tells it to rename tagRECT to RECT:
 
-[generation/scraper/baseRemap.rsp](generation/scraper/baseRemap.rsp)
+[generation/WinSDK/scraper.settings.rsp](generation/WinSDK/scraper.settings.rsp)
 
     tagRECT=RECT
 

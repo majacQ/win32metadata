@@ -15,6 +15,11 @@ namespace MetadataUtils
 
         public ConstantWriter(string path, string @namespace, string sourceHeaderText, Dictionary<string, string> withAttributes)
         {
+            if (sourceHeaderText == null)
+            {
+                sourceHeaderText = string.Empty;
+            }
+
             this.path = path;
             this.@namespace = @namespace;
             this.headerText = sourceHeaderText;
@@ -37,7 +42,7 @@ namespace MetadataUtils
             }
         }
 
-        public void AddPropKey(string name, string args)
+        public void AddPropKey(string structType, string name, string args)
         {
             if (this.namesToValues.ContainsKey(name))
             {
@@ -48,7 +53,7 @@ namespace MetadataUtils
 
             this.Writer.WriteLine(
 $@"        [PropertyKey({args})]
-        public static readonly PROPERTYKEY {name};");
+        public static readonly {structType} {name};");
 
             this.Writer.WriteLine();
         }
@@ -86,7 +91,7 @@ $"        public const {type} {name} = {valueText};");
 
         public static string FixIntValueText(bool forceUnsigned, ref string type, string valueText)
         {
-            if (valueText.Length > 0 && char.IsLetter(valueText[0]))
+            if (valueText.Length > 0 && (char.IsLetter(valueText[0]) || valueText[0] == '_'))
             {
                 // This means our value is probably using an enum or some other expresssion,
                 // so don't mess with the valueText
@@ -103,15 +108,44 @@ $"        public const {type} {name} = {valueText};");
             bool signed = false;
             bool is64Bit = false;
 
-            if (valueText.EndsWith("UL") || valueText.EndsWith("ul"))
+            if (valueText.EndsWith("ULL", StringComparison.OrdinalIgnoreCase))
+            {
+                signed = false;
+                is64Bit = true;
+                valueText = valueText.Substring(0, valueText.Length - 3);
+            }
+            else if (valueText.EndsWith("UL", StringComparison.OrdinalIgnoreCase))
             {
                 signed = false;
                 valueText = valueText.Substring(0, valueText.Length - 2);
             }
-            else if (valueText.EndsWith('L') || valueText.EndsWith('l'))
+            else if (valueText.EndsWith("U", StringComparison.OrdinalIgnoreCase))
+            {
+                signed = false;
+                valueText = valueText.Substring(0, valueText.Length - 1);
+            }
+            else if (valueText.EndsWith("LL", StringComparison.OrdinalIgnoreCase))
+            {
+                signed = true;
+                is64Bit = true;
+                valueText = valueText.Substring(0, valueText.Length - 2);
+            }
+            else if (valueText.EndsWith("L", StringComparison.OrdinalIgnoreCase))
             {
                 signed = true;
                 valueText = valueText.Substring(0, valueText.Length - 1);
+            }
+            else if (valueText.EndsWith("ui64", StringComparison.OrdinalIgnoreCase))
+            {
+                signed = false;
+                is64Bit = true;
+                valueText = valueText.Substring(0, valueText.Length - 4);
+            }
+            else if (valueText.EndsWith("i64", StringComparison.OrdinalIgnoreCase))
+            {
+                signed = true;
+                is64Bit = true;
+                valueText = valueText.Substring(0, valueText.Length - 3);
             }
 
             if (valueText.StartsWith('-'))
@@ -163,15 +197,17 @@ $"        public const {type} {name} = {valueText};");
             return valueText;
         }
 
-        public void AddInt(string forceType, string nativeTypeName, string name, string valueText)
+        public void AddInt(string forceType, string nativeTypeName, string name, string valueText, out string finalType)
         {
+            finalType = null;
+
             if (this.namesToValues.ContainsKey(name))
             {
                 return;
             }
 
             string type = null;
-            if (nativeTypeName == "HRESULT" || nativeTypeName == "LPCWSTR" || nativeTypeName == "HWND")
+            if (nativeTypeName == "HRESULT" || nativeTypeName == "LPCWSTR" || nativeTypeName == "LPCSTR" || nativeTypeName == "HWND")
             {
                 type = "int";
             }
@@ -185,7 +221,7 @@ $"        public const {type} {name} = {valueText};");
 $"        [NativeTypeName(\"{nativeTypeName}\")]");
             }
 
-            string finalType = forceType != null ? forceType : type;
+            finalType = forceType != null ? forceType : type;
 
             this.AddValue(finalType, name, valueText);
         }

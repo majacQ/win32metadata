@@ -1,13 +1,14 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.CommandLine;
 using System.CommandLine.Invocation;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Metadata;
-using System.Reflection.PortableExecutable;
 using System.Text;
+using System.Text.RegularExpressions;
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.Metadata;
 using ICSharpCode.Decompiler.TypeSystem;
@@ -74,6 +75,49 @@ namespace WinmdUtilsProgram
 
             showPointersToDelegates.Handler = CommandHandler.Create<FileInfo, string[], IConsole>(ShowPointersToDelegates);
 
+            var showLibImports = new Command("dumpImports", "Show lib imports.")
+            {
+                new Option<FileInfo>("--lib", "The lib path.") { IsRequired = true }.ExistingOnly(),
+            };
+
+            showLibImports.Handler = CommandHandler.Create<FileInfo, IConsole>(ShowLibImports);
+
+            var createLibRsp = new Command("createLibRsp", "Create lib rsp.")
+            {
+                new Option<string>("--lib", "A lib path.", ArgumentArity.ZeroOrMore),
+                new Option<string>("--libDir", "A directory containing libs.", ArgumentArity.ZeroOrMore),
+                new Option<string>("--exclude", "A function to exclude.", ArgumentArity.ZeroOrMore),
+                new Option<FileInfo>("--outputRsp", "Output rsp file."),
+                new Option<FileInfo>("--inputRsp", "Input rsp file use to resolve duplicate libs for the same function."),
+            };
+
+            createLibRsp.Handler = CommandHandler.Create<string[], string[], string[], FileInfo, FileInfo, IConsole>(CreateLibRsp);
+
+            var showNamespaceDependencies = new Command("showNamespaceDependencies", "Show namespace dependencies.")
+            {
+                new Option<FileInfo>("--winmd", "The winmd to inspect.") { IsRequired = true }.ExistingOnly(),
+                new Option<string>("--ignoreDependNamespace", "Ignore dependencies to this namespace.", ArgumentArity.OneOrMore),
+                new Option<string>("--namespaceFilter", "Namespace filter", ArgumentArity.OneOrMore),
+                new Option<int>("--maxBroughtInBy", getDefaultValue: () => int.MaxValue,  description: "The max number of items to display of a type that brought in a namespace"),
+                new Option<int>("--maxDependTypes", getDefaultValue: () => int.MaxValue,  description: "The max number of types to display that brought in a namespace"),
+            };
+
+            showNamespaceDependencies.Handler = CommandHandler.Create<FileInfo, string[], string[], int, int, IConsole>(ShowNamespaceDependencies);
+
+            var showNamespaceCycles = new Command("showNamespaceCycles", "Show namespace cyclical dependencies.")
+            {
+                new Option<FileInfo>("--winmd", "The winmd to inspect.") { IsRequired = true }.ExistingOnly(),
+            };
+
+            showNamespaceCycles.Handler = CommandHandler.Create<FileInfo, IConsole>(ShowNamespaceCycles);
+
+            var showBrokenArchTypes = new Command("showBrokenArchTypes", "Show broken architecture types.")
+            {
+                new Option<FileInfo>("--winmd", "The winmd to inspect.") { IsRequired = true }.ExistingOnly(),
+            };
+
+            showBrokenArchTypes.Handler = CommandHandler.Create<FileInfo, IConsole>(ShowBrokenArchTypes);
+
             var rootCommand = new RootCommand("Win32metadata winmd utils")
             {
                 showMissingImportsCommand,
@@ -82,7 +126,12 @@ namespace WinmdUtilsProgram
                 showDuplicateConstants,
                 showEmptyDelegates,
                 showPointersToDelegates,
-                compareCommand
+                compareCommand,
+                showLibImports,
+                createLibRsp,
+                showNamespaceDependencies,
+                showNamespaceCycles,
+                showBrokenArchTypes
             };
 
             return rootCommand.Invoke(args);
@@ -182,6 +231,173 @@ namespace WinmdUtilsProgram
             }
         }
 
+        public static int CreateLibRsp(string[] lib, string[] libDir, string[] exclude, FileInfo outputRsp, FileInfo inputRsp, IConsole console)
+        {
+            List<string> libPaths = new List<string>();
+            HashSet<string> visitedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> excludes = new HashSet<string>();
+
+            if (exclude != null)
+            {
+                foreach (var item in exclude)
+                {
+                    excludes.Add(item);
+                }
+            }
+
+            if (lib != null)
+            {
+                foreach (var libPath in lib)
+                {
+                    if (!File.Exists(libPath))
+                    {
+                        console.Out.Write($"Error: {libPath} not found.");
+                        return -1;
+                    }
+
+                    libPaths.Add(libPath);
+                    visitedPaths.Add(libPath);
+                }
+            }
+
+            if (libDir != null)
+            {
+                foreach (var dir in libDir)
+                {
+                    foreach (var libPath in Directory.GetFiles(dir, "*.lib"))
+                    {
+                        if (!visitedPaths.Contains(libPath))
+                        {
+                            libPaths.Add(libPath);
+                            visitedPaths.Add(libPath);
+                        }
+                    }
+                }
+            }
+
+            OrderedDictionary procNameToDll = new OrderedDictionary();
+            Dictionary<string, string> inputEntries = new Dictionary<string, string>();
+
+            if (inputRsp != null)
+            {
+                foreach (var line in File.ReadAllLines(inputRsp.FullName))
+                {
+                    int equal = line.IndexOf('=');
+                    if (equal != -1)
+                    {
+                        var procName = line.Substring(0, equal);
+                        var dllName = line.Substring(equal + 1);
+                        inputEntries[procName] = dllName;
+                    }
+                }
+            }
+
+            foreach (var libFile in libPaths)
+            {
+                foreach (var importInfo in LibScraper.GetImportInfos(libFile))
+                {
+                    List<string> dlls;
+                    string fixedDll = Path.GetFileNameWithoutExtension(importInfo.Dll);
+
+                    // Skip mangled names
+                    if (importInfo.ProcName.StartsWith('?'))
+                    {
+                        continue;
+                    }
+
+                    // Skip ones we are told to exclude
+                    if (excludes.Contains(importInfo.ProcName))
+                    {
+                        continue;
+                    }
+
+                    if (!procNameToDll.Contains(importInfo.ProcName))
+                    {
+                        dlls = new List<string>();
+                        procNameToDll[importInfo.ProcName] = dlls;
+                        dlls.Add(fixedDll);
+                    }
+                    else
+                    {
+                        dlls = (List<string>)procNameToDll[importInfo.ProcName];
+
+                        // Don't overwrite an existing value with an API set
+                        if (fixedDll.StartsWith("api-ms") || fixedDll.StartsWith("ext-ms"))
+                        {
+                            continue;
+                        }
+
+                        if (dlls.Contains(fixedDll))
+                        {
+                            continue;
+                        }
+
+                        // Only concat the new value to the old one if the old one is
+                        // not an api set. If the old one is an api set, override it.
+                        string oldValue = dlls[0];
+                        if (!oldValue.StartsWith("api-ms") && !oldValue.StartsWith("ext-ms"))
+                        {
+                            dlls.Add(fixedDll);
+                        }
+                        else
+                        {
+                            dlls[0] = fixedDll;
+                        }
+                    }
+                }
+            }
+
+            using StreamWriter streamWriter = new StreamWriter(outputRsp.FullName);
+
+            streamWriter.WriteLine("--with-librarypath");
+
+            List<string> linesToFix = new List<string>();
+            foreach (string procName in procNameToDll.Keys)
+            {
+                var dlls = (List<string>)procNameToDll[procName];
+                bool lineNeedsFixing = false;
+                if (!inputEntries.TryGetValue(procName, out string value))
+                {
+                    value = string.Join(',', dlls.ToArray());
+                    if (dlls.Count > 1)
+                    {
+                        lineNeedsFixing = true;
+                    }
+                }
+
+                string line = $"{procName}={value}";
+                streamWriter.WriteLine(line);
+
+                if (lineNeedsFixing)
+                {
+                    linesToFix.Add(line);
+                }
+            }
+
+            if (linesToFix.Count != 0)
+            {
+                console.Out.Write("One or more procedures map to multiple DLLs:\n");
+                foreach (var line in linesToFix)
+                {
+                    console.Out.Write(line + "\n");
+                }
+
+                return -1;
+            }
+
+            return 0;
+        }
+
+        public static int ShowLibImports(FileInfo lib, IConsole console)
+        {
+            foreach (var libInfo in LibScraper.GetImportInfos(lib.FullName))
+            {
+                console.Out.Write($"{libInfo.ProcName}={libInfo.Dll}\n");
+            }
+
+            return 0;
+        }
+
         public static int ShowPointersToDelegates(FileInfo winmd, string[] allowItem, IConsole console)
         {
             HashSet<string> allowTable = new HashSet<string>(allowItem);
@@ -219,8 +435,7 @@ namespace WinmdUtilsProgram
 
         public static int ShowDuplicateConstants(FileInfo winmd, IConsole console)
         {
-            DecompilerSettings settings = new DecompilerSettings() { ThrowOnAssemblyResolveErrors = false };
-            DecompilerTypeSystem winmd1 = CreateTypeSystemFromFile(winmd.FullName, settings);
+            DecompilerTypeSystem winmd1 = DecompilerTypeSystemUtils.CreateTypeSystemFromFile(winmd.FullName);
             Dictionary<string, List<string>> nameToOwner = new Dictionary<string, List<string>>();
 
             foreach (var type in winmd1.GetTopLevelTypeDefinitions())
@@ -247,7 +462,7 @@ namespace WinmdUtilsProgram
 
                 if (type.Kind == TypeKind.Enum || (type.Kind == TypeKind.Class && type.Name == "Apis"))
                 {
-                    foreach (var field in type.GetFields())
+                    foreach (var field in type.GetFields(options: GetMemberOptions.IgnoreInheritedMembers))
                     {
                         if (field.Name == "value__")
                         {
@@ -296,8 +511,7 @@ namespace WinmdUtilsProgram
 
         public static int ShowDuplicateTypes(FileInfo winmd, IConsole console)
         {
-            DecompilerSettings settings = new DecompilerSettings() { ThrowOnAssemblyResolveErrors = false };
-            DecompilerTypeSystem winmd1 = CreateTypeSystemFromFile(winmd.FullName, settings);
+            DecompilerTypeSystem winmd1 = DecompilerTypeSystemUtils.CreateTypeSystemFromFile(winmd.FullName);
 
             Dictionary<string, List<string>> nameToNamespaces = new Dictionary<string, List<string>>();
 
@@ -434,10 +648,276 @@ namespace WinmdUtilsProgram
             return string.Empty;
         }
 
+        private static bool VerifyTypeHasRightArch(
+            Dictionary<string, List<ITypeDefinition>> namesToArchDefs,
+            IEntity owner,
+            IType type,
+            Architecture requiredArch,
+            IConsole console)
+        {
+            bool success = true;
+
+            if (owner != type)
+            {
+                var currentType = type;
+                while (currentType.Kind == TypeKind.Array)
+                {
+                    ArrayType arrayType = (ArrayType)currentType;
+                    currentType = arrayType.ElementType;
+                }
+
+                while (currentType.Kind == TypeKind.Pointer)
+                {
+                    PointerType pointerType = (PointerType)currentType;
+                    currentType = pointerType.ElementType;
+                }
+
+                // If the type isn't in the map, it's not arch-specific, so return success
+                if (!namesToArchDefs.TryGetValue(currentType.FullName, out var foundArchTypes))
+                {
+                    return true;
+                }
+
+                bool found = false;
+                Architecture typeArches = Architecture.None;
+                foreach (var archType in foundArchTypes)
+                {
+                    var typeArchAttr =
+                        archType.GetAttributes().Single(a => a.AttributeType.FullName == "Windows.Win32.Interop.SupportedArchitectureAttribute");
+
+                    var typeArch = (Architecture)typeArchAttr.FixedArguments[0].Value;
+                    typeArches |= typeArch;
+                    if ((typeArches & requiredArch) == requiredArch)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    console.Out.Write($"{owner.FullName} supports '{requiredArch}' but referenced type {type.FullName} only supports '{typeArches}'");
+                    success = false;
+                }
+            }
+
+            if (type.Kind == TypeKind.Struct)
+            {
+                foreach (var field in type.GetFields())
+                {
+                    if (!VerifyTypeHasRightArch(namesToArchDefs, owner, field.Type, requiredArch, console))
+                    {
+                        success = false;
+                    }
+                }
+            }
+            else if (type.Kind == TypeKind.Delegate)
+            {
+                var invoke = type.GetMethods(m => m.Name == "Invoke").Single();
+                foreach (var param in invoke.Parameters)
+                {
+                    if (!VerifyTypeHasRightArch(namesToArchDefs, owner, param.Type, requiredArch, console))
+                    {
+                        success = false;
+                    }
+                }
+            }
+
+            return success;
+        }
+
+        public static int ShowBrokenArchTypes(FileInfo winmd, IConsole console)
+        {
+            DecompilerTypeSystem winmd1 = DecompilerTypeSystemUtils.CreateTypeSystemFromFile(winmd.FullName);
+
+            int badTopLevelTypes = 0;
+            Dictionary<string, List<ITypeDefinition>> namesToArchDefs = new Dictionary<string, List<ITypeDefinition>>();
+
+            foreach (var type in winmd1.GetTopLevelTypeDefinitions()
+                .Where(t => t.GetAttributes()
+                    .Any(a => a.AttributeType.FullName == "Windows.Win32.Interop.SupportedArchitectureAttribute")))
+            {
+                if (!namesToArchDefs.TryGetValue(type.FullName, out var list))
+                {
+                    list = new();
+                    namesToArchDefs[type.FullName] = list;
+                }
+
+                list.Add(type);
+            }
+
+            foreach (var type in namesToArchDefs.SelectMany(map => map.Value))
+            {
+                var archAttr = type.GetAttributes().Single(a => a.AttributeType.FullName == "Windows.Win32.Interop.SupportedArchitectureAttribute");
+                Architecture arch = (Architecture)archAttr.FixedArguments[0].Value;
+
+                if (!VerifyTypeHasRightArch(namesToArchDefs, type, type, arch, console))
+                {
+                    badTopLevelTypes++;
+                }
+            }
+
+            foreach (var apisClass in winmd1.GetTopLevelTypeDefinitions().Where(t => t.Kind == TypeKind.Class && t.Name == "Apis"))
+            {
+                foreach (var method in apisClass.Methods.Where(
+                    m => m.IsStatic && m.DeclaringType == apisClass && m.GetAttributes()
+                        .Any(a => a.AttributeType.FullName == "Windows.Win32.Interop.SupportedArchitectureAttribute")))
+                {
+                    var archAttr = method.GetAttributes().Single(a => a.AttributeType.FullName == "Windows.Win32.Interop.SupportedArchitectureAttribute");
+                    Architecture arch = (Architecture)archAttr.FixedArguments[0].Value;
+
+                    foreach (var param in method.Parameters)
+                    {
+                        VerifyTypeHasRightArch(namesToArchDefs, method, param.Type, arch, console);
+                    }
+                }
+            }
+
+            if (badTopLevelTypes == 0)
+            {
+                console.Out.Write("No broken arch-specific types or methods found.\r\n");
+            }
+
+            return badTopLevelTypes == 0 ? 0 : -1;
+        }
+
+        public static int ShowNamespaceCycles(FileInfo winmd, IConsole console)
+        {
+            foreach (var cycle in NamespaceDependencyUtil.GetNamespaceCycles(winmd.FullName))
+            {
+                bool first = true;
+                foreach (var ns in cycle)
+                {
+                    if (!first)
+                    {
+                        console.Out.Write(" -> ");
+                    }
+                    else
+                    {
+                        first = false;
+                    }
+
+                    console.Out.Write(ns);
+                }
+
+                console.Out.Write("\r\n");
+            }
+
+            return 0;
+        }
+
+        public static int ShowNamespaceDependencies(FileInfo winmd, string[] ignoreDependNamespace, string[] namespaceFilter, int maxBroughtInBy, int maxDependTypes, IConsole console)
+        {
+            List<Regex> namespaceFilterRegex = new List<Regex>();
+            if (namespaceFilter != null)
+            {
+                foreach (var filterSpec in namespaceFilter)
+                {
+                    string fixedPattern = filterSpec.Replace(".", @"\.");
+                    fixedPattern = fixedPattern.Replace("*", ".*");
+
+                    if (!fixedPattern.StartsWith('^'))
+                    {
+                        fixedPattern = $"^{fixedPattern}";
+                    }
+
+                    if (!fixedPattern.EndsWith('$'))
+                    {
+                        fixedPattern = $"{fixedPattern}$";
+                    }
+
+                    namespaceFilterRegex.Add(new Regex(fixedPattern, RegexOptions.IgnoreCase));
+                }
+            }
+
+            HashSet<string> ignoreNamespaces = new();
+            foreach (var ns in ignoreDependNamespace)
+            {
+                ignoreNamespaces.Add(ns);
+            }
+
+            foreach (var item in NamespaceDependencyUtil.GetNamespaceDependencies(winmd.FullName))
+            {
+                bool isMatch = namespaceFilterRegex.Count == 0 || namespaceFilterRegex.Any(r => r.IsMatch(item.Namespace));
+                if (!isMatch)
+                {
+                    continue;
+                }
+
+                console.Out.Write($"{item.Namespace}\r\n");
+
+                string[] allDependNamespaces = item.AllDependencyNamespaces.Where(ns => !ignoreNamespaces.Contains(ns)).ToArray();
+                if (allDependNamespaces.Length != 0)
+                {
+                    console.Out.Write($"  All dependent namespaces: {string.Join(", ", allDependNamespaces)}\r\n");
+                }
+
+                var allDependsByNamespace = item.GetDependenciesByNamespace().Where(d => !ignoreNamespaces.Contains(d.Key)).ToArray();
+                foreach (var dependsByNamespace in allDependsByNamespace)
+                {
+                    var currentNamespace = dependsByNamespace.Key;
+
+                    console.Out.Write($"  {dependsByNamespace.Key}\r\n");
+
+                    var allDependTypes = dependsByNamespace.Value.ToArray();
+                    var dependCount = 0;
+                    foreach (var depend in allDependTypes)
+                    {
+                        if (dependCount >= maxDependTypes)
+                        {
+                            int remainingCount = allDependTypes.Length - dependCount;
+                            console.Out.Write($"    ({remainingCount} more...)\r\n");
+                            break;
+                        }
+
+                        console.Out.Write($"    {depend.Type.Name}: ");
+
+                        dependCount++;
+
+                        bool first = true;
+                        string[] broughtInByItems = depend.BroughtInBy.ToArray();
+                        int broughtInCount = 0;
+                        foreach (var broughtInBy in broughtInByItems)
+                        {
+                            if (broughtInCount == maxBroughtInBy)
+                            {
+                                int itemsRemaining = broughtInByItems.Length - broughtInCount;
+                                console.Out.Write($" ({itemsRemaining} more...)");
+                                break;
+                            }
+
+                            if (first)
+                            {
+                                first = false;
+                            }
+                            else
+                            {
+                                console.Out.Write(", ");
+                            }
+
+                            console.Out.Write(broughtInBy);
+                            broughtInCount++;
+                        }
+
+                        console.Out.Write("\r\n");
+                    }
+
+                    console.Out.Write("\r\n");
+                }
+
+                if (allDependsByNamespace.Length != 0)
+                {
+                    console.Out.Write("\r\n\r\n");
+                }
+            }
+
+            return 0;
+        }
+
         public static int ShowDuplicateImports(FileInfo winmd, IConsole console)
         {
             DecompilerSettings settings = new DecompilerSettings() { ThrowOnAssemblyResolveErrors = false };
-            DecompilerTypeSystem winmd1 = CreateTypeSystemFromFile(winmd.FullName, settings);
+            DecompilerTypeSystem winmd1 = DecompilerTypeSystemUtils.CreateTypeSystemFromFile(winmd.FullName);
 
             Dictionary<string, List<string>> dllImportsToClassNames = new Dictionary<string, List<string>>();
 
@@ -523,54 +1003,59 @@ namespace WinmdUtilsProgram
             return dupsFound ? -1 : 0;
         }
 
-        static PEFile LoadPEFile(string fileName, DecompilerSettings settings)
-        {
-            settings.LoadInMemory = true;
-            return new PEFile(
-                fileName,
-                new FileStream(fileName, FileMode.Open, FileAccess.Read),
-                streamOptions: PEStreamOptions.PrefetchEntireImage,
-                metadataOptions: settings.ApplyWindowsRuntimeProjections ? MetadataReaderOptions.ApplyWindowsRuntimeProjections : MetadataReaderOptions.None
-            );
-        }
-
-        static DecompilerTypeSystem CreateTypeSystemFromFile(string fileName, DecompilerSettings settings)
-        {
-            settings.LoadInMemory = true;
-            var file = LoadPEFile(fileName, settings);
-            var resolver = new UniversalAssemblyResolver(fileName, settings.ThrowOnAssemblyResolveErrors, file.DetectTargetFrameworkId());
-            return new DecompilerTypeSystem(file, resolver);
-        }
-
         public static bool CompareFields(IField field1, IField field2, IConsole console)
         {
             bool ret = CompareAttributes(field1.Name, field1.GetAttributes(), field2.GetAttributes(), console);
 
-            if (field1.IsConst)
+            // Using the ReflectionName gets us the name of the type in
+            // metadata. The FullName might not be fully resolvable by the
+            // library because it doesn't know how to resolve arch-specific types
+            if (field1.Type.ReflectionName != field2.Type.ReflectionName)
             {
-                if (!field2.IsConst)
+                console?.Out.Write($"{field1.DeclaringType.FullName}.{field1.Name}...{field1.Type.ReflectionName} => {field2.Type.ReflectionName}\r\n");
+                ret = false;
+            }
+            else
+            {
+                if (field1.IsConst)
                 {
-                    console?.Out.Write($"winmd1: {field1.Name} const, winmd2: not\r\n");
-                    ret = false;
-                }
-                else
-                {
-                    var fieldVal1 = field1.GetConstantValue();
-                    var fieldVal2 = field2.GetConstantValue();
-
-                    if (fieldVal1.ToString() != fieldVal2.ToString())
+                    if (!field2.IsConst)
                     {
-                        console?.Out.Write($"winmd1: {field1.Name} = {fieldVal1}, winmd2 = {fieldVal2}\r\n");
+                        console?.Out.Write($"winmd1: {field1.Name} const, winmd2: not\r\n");
                         ret = false;
                     }
+                    else
+                    {
+                        var fieldVal1 = field1.GetConstantValue();
+                        var fieldVal2 = field2.GetConstantValue();
+
+                        if (fieldVal1 == null)
+                        {
+                            console?.Out.Write($"winmd1: {field1.Name} is a constant with a null value\r\n");
+                        }
+
+                        if (fieldVal2 == null)
+                        {
+                            console?.Out.Write($"winmd2: {field2.Name} is a constant with a null value\r\n");
+                        }
+
+                        string val1 = fieldVal1?.ToString();
+                        string val2 = fieldVal2?.ToString();
+
+                        if (val1 != val2)
+                        {
+                            console?.Out.Write($"winmd1: {field1.Name} = {val1}, winmd2 = {val2}\r\n");
+                            ret = false;
+                        }
+                    }
                 }
-            }
-            else if (field2.IsConst)
-            {
-                if (!field2.IsConst)
+                else if (field2.IsConst)
                 {
-                    console?.Out.Write($"winmd1: {field1.Name} not const, winmd2: const\r\n");
-                    ret = false;
+                    if (!field2.IsConst)
+                    {
+                        console?.Out.Write($"winmd1: {field1.Name} not const, winmd2: const\r\n");
+                        ret = false;
+                    }
                 }
             }
 
@@ -597,13 +1082,6 @@ namespace WinmdUtilsProgram
                 }
 
                 type2Fields.Remove(field2.Name);
-
-                if (field1.Type.Name != field2.Type.Name)
-                {
-                    console?.Out.Write($"{type1.FullTypeName}.{field1.Name}...{field1.Type.Name} => {field2.Type.Name}\r\n");
-                    ret = false;
-                    continue;
-                }
 
                 ret &= CompareFields(field1, field2, console);
             }
@@ -857,6 +1335,7 @@ namespace WinmdUtilsProgram
             ret &= CompareFieldsOnTypes(type1, type2, console);
             ret &= CompareMethodsOnType(type1, type2, console);
             ret &= CompareAttributes(type1.FullName, type1.GetAttributes(), type2.GetAttributes(), console);
+            ret &= CompareTypes(type1.NestedTypes, type2.NestedTypes, console);
 
             return ret;
         }
@@ -885,7 +1364,7 @@ namespace WinmdUtilsProgram
             return name;
         }
 
-        private static Dictionary<string, List<IMember>> GetApiMemberNamesToMethodDefinitions(DecompilerTypeSystem winmd)
+        private static Dictionary<string, List<IMember>> GetApiMemberNamesToMemberDefinitions(DecompilerTypeSystem winmd)
         {
             Dictionary<string, List<IMember>> ret = new Dictionary<string, List<IMember>>();
             foreach (var type1 in winmd.GetTopLevelTypeDefinitions())
@@ -927,21 +1406,11 @@ namespace WinmdUtilsProgram
             return ret;
         }
 
-        private static Dictionary<string, List<ITypeDefinition>> GetShortNamesToTypeDefinitions(DecompilerTypeSystem winmd)
+        private static Dictionary<string, List<ITypeDefinition>> GetShortNamesToTypeDefinitions(IEnumerable<ITypeDefinition> types)
         {
             Dictionary<string, List<ITypeDefinition>> ret = new Dictionary<string, List<ITypeDefinition>>();
-            foreach (var type1 in winmd.GetTopLevelTypeDefinitions())
+            foreach (var type1 in types)
             {
-                if (type1.FullName == "<Module>")
-                {
-                    continue;
-                }
-
-                if (type1.ParentModule != winmd.MainModule)
-                {
-                    continue;
-                }
-
                 string name = type1.Name;
                 if (!ret.TryGetValue(name, out var list))
                 {
@@ -955,21 +1424,11 @@ namespace WinmdUtilsProgram
             return ret;
         }
 
-        private static Dictionary<string, ITypeDefinition> GetNamesToTypeDefinitions(DecompilerTypeSystem winmd)
+        private static Dictionary<string, ITypeDefinition> GetNamesToTypeDefinitions(IEnumerable<ITypeDefinition> types)
         {
             Dictionary<string, ITypeDefinition> ret = new Dictionary<string, ITypeDefinition>();
-            foreach (var type1 in winmd.GetTopLevelTypeDefinitions())
+            foreach (var type1 in types)
             {
-                if (type1.FullName == "<Module>")
-                {
-                    continue;
-                }
-
-                if (type1.ParentModule != winmd.MainModule)
-                {
-                    continue;
-                }
-
                 string name = GetFullTypeName(type1);
                 ret[name] = type1;
             }
@@ -977,29 +1436,21 @@ namespace WinmdUtilsProgram
             return ret;
         }
 
-        public static int CompareWinmds(FileInfo first, FileInfo second, string exclusions, IConsole console)
+        private static IEnumerable<ITypeDefinition> GetSelfDefinedWinmdToplevelTypes(DecompilerTypeSystem winmd)
         {
+            return winmd.GetTopLevelTypeDefinitions().Where(
+                type => type.ParentModule == winmd.MainModule && type.FullName != "<Module>");
+        }
+
+        private static bool CompareTypes(IEnumerable<ITypeDefinition> types1, IEnumerable<ITypeDefinition> types2, IConsole console)
+        {
+            Dictionary<string, ITypeDefinition> winmd2NamesToTypes = GetNamesToTypeDefinitions(types2);
+            Dictionary<string, List<ITypeDefinition>> winmd2ShortNamesToTypes = GetShortNamesToTypeDefinitions(types2);
             bool same = true;
 
-            DecompilerSettings settings = new DecompilerSettings() { ThrowOnAssemblyResolveErrors = false };
-            DecompilerTypeSystem winmd1 = CreateTypeSystemFromFile(first.FullName, settings);
-            DecompilerTypeSystem winmd2 = CreateTypeSystemFromFile(second.FullName, settings);
-            Dictionary<string, ITypeDefinition> winmd2NamesToTypes = GetNamesToTypeDefinitions(winmd2);
-            Dictionary<string, List<ITypeDefinition>> winmd2ShortNamesToTypes = GetShortNamesToTypeDefinitions(winmd2);
-
             HashSet<string> visitedNames = new HashSet<string>();
-            foreach (var type1 in winmd1.GetTopLevelTypeDefinitions())
+            foreach (var type1 in types1)
             {
-                if (type1.FullName == "<Module>")
-                {
-                    continue;
-                }
-
-                if (type1.ParentModule != winmd1.MainModule)
-                {
-                    continue;
-                }
-
                 // We'll compare the members of Apis in their own way
                 if (type1.Name == "Apis")
                 {
@@ -1040,19 +1491,9 @@ namespace WinmdUtilsProgram
                 same &= CompareTypes(type1, type2, console);
             }
 
-            Dictionary<string, ITypeDefinition> winmd1NamesToTypes = GetNamesToTypeDefinitions(winmd1);
-            foreach (var type2 in winmd2.GetTopLevelTypeDefinitions())
+            Dictionary<string, ITypeDefinition> winmd1NamesToTypes = GetNamesToTypeDefinitions(types1);
+            foreach (var type2 in types2)
             {
-                if (type2.FullName == "<Module>")
-                {
-                    continue;
-                }
-
-                if (type2.ParentModule != winmd2.MainModule)
-                {
-                    continue;
-                }
-
                 // We'll compare the members of Apis in their own way
                 if (type2.Name == "Apis")
                 {
@@ -1073,8 +1514,25 @@ namespace WinmdUtilsProgram
                 }
             }
 
-            var apiNameToMembers1 = GetApiMemberNamesToMethodDefinitions(winmd1);
-            var apiNameToMembers2 = GetApiMemberNamesToMethodDefinitions(winmd2);
+            return same;
+        }
+
+        public static int CompareWinmds(FileInfo first, FileInfo second, string exclusions, IConsole console)
+        {
+            bool same = true;
+
+            DecompilerTypeSystem winmd1 = DecompilerTypeSystemUtils.CreateTypeSystemFromFile(first.FullName);
+            DecompilerTypeSystem winmd2 = DecompilerTypeSystemUtils.CreateTypeSystemFromFile(second.FullName);
+
+            CompareAttributes("Assembly (informational only)", winmd1.MainModule.GetAssemblyAttributes(), winmd2.MainModule.GetAssemblyAttributes(), console);
+
+            var winmd1Types = GetSelfDefinedWinmdToplevelTypes(winmd1);
+            var winmd2Types = GetSelfDefinedWinmdToplevelTypes(winmd2);
+
+            same &= CompareTypes(winmd1Types, winmd2Types, console);
+
+            var apiNameToMembers1 = GetApiMemberNamesToMemberDefinitions(winmd1);
+            var apiNameToMembers2 = GetApiMemberNamesToMemberDefinitions(winmd2);
 
             HashSet<string> visitedM2Names = new HashSet<string>();
             foreach (var api1MemberInfo in apiNameToMembers1)

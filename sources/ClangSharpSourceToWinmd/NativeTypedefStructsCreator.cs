@@ -1,123 +1,98 @@
 ﻿using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
-using CsvHelper.Configuration;
 
 namespace ClangSharpSourceToWinmd
 {
     public static class NativeTypedefStructsCreator
     {
-        public static void CreateNativeTypedefsSourceFile(Dictionary<string, string> methodNamesToNamespaces, IEnumerable<string> items, string outputFile)
+        public static void WriteToStream(Dictionary<string, string> methodNamesToNamespaces, IEnumerable<AutoType> items, Stream output)
         {
-            if (items == null)
-            {
-                return;
-            }
-
-            if (!Directory.Exists(Path.GetDirectoryName(outputFile)))
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(outputFile));
-            }
-
-            CsvConfiguration config = new CsvConfiguration(CultureInfo.InvariantCulture) { MissingFieldFound = null };
-            using (StringReader stringReader = new StringReader(ConvertLinesToCsvString(items)))
-            using (CsvHelper.CsvReader reader = new CsvHelper.CsvReader(stringReader, config))
-            using (StreamWriter writer = new StreamWriter(outputFile))
-            {
-                writer.Write(
+            using var writer = new StreamWriter(output, leaveOpen: true);
+            writer.Write(
 @"using System;
 using Windows.Win32.Interop;
 
 ");
-                string currentNamespace = null;
-                foreach (var item in reader.GetRecords<AutoType>().OrderBy(a => a.Namespace))
+            string currentNamespace = null;
+            foreach (AutoType item in items.OrderBy(a => a.Namespace))
+            {
+                string safety = item.ValueType.Contains("*") ? "unsafe " : string.Empty;
+                var valueType = item.ValueType;
+                if (valueType == "DECLARE_HANDLE" || valueType == "AllJoynHandle")
                 {
-                    string safety = item.ValueType.Contains("*") ? "unsafe " : string.Empty;
-                    var valueType = item.ValueType;
-                    if (valueType == "DECLARE_HANDLE" || valueType == "AllJoynHandle")
+                    valueType = "IntPtr";
+                }
+
+                if (!string.IsNullOrEmpty(item.CloseApi))
+                {
+                    if (!methodNamesToNamespaces.TryGetValue(item.CloseApi, out var apiNamespace))
                     {
-                        valueType = "IntPtr";
+                        throw new System.InvalidOperationException($"The API {item.CloseApi} was not found in the .cs files. The auto type {item.Name} needs to be given an explicit namespace.");
                     }
 
-                    if (!string.IsNullOrEmpty(item.CloseApi))
+                    if (string.IsNullOrEmpty(item.Namespace))
                     {
-                        if (!methodNamesToNamespaces.TryGetValue(item.CloseApi, out var apiNamespace))
+                        if (apiNamespace.Contains(';'))
                         {
-                            throw new System.InvalidOperationException($"The API {item.CloseApi} was not found in the .cs files. The auto type {item.Name} needs to be given an explicit namespace.");
+                            throw new System.InvalidOperationException($"The API {item.CloseApi} has multiple namespaces: {apiNamespace}. The auto type {item.Name} needs to be given an explicit namespace.");
                         }
-
-                        if (string.IsNullOrEmpty(item.Namespace))
+                        else
                         {
-                            if (apiNamespace.Contains(';'))
-                            {
-                                throw new System.InvalidOperationException($"The API {item.CloseApi} has multiple namespaces: {apiNamespace}. The auto type {item.Name} needs to be given an explicit namespace.");
-                            }
-                            else
-                            {
-                                item.Namespace = apiNamespace;
-                            }
+                            item.Namespace = apiNamespace;
                         }
                     }
+                }
 
-                    if (item.Namespace != currentNamespace)
+                if (string.IsNullOrEmpty(item.Namespace))
+                {
+                    throw new System.InvalidOperationException($"Autotype {item.Name} needs a namespace to be specified.");
+                }
+
+                if (item.Namespace != currentNamespace)
+                {
+                    if (currentNamespace != null)
                     {
-                        if (currentNamespace != null)
-                        {
-                            writer.WriteLine("}");
-                        }
+                        writer.WriteLine("}");
+                    }
 
-                        currentNamespace = item.Namespace;
-                        writer.WriteLine(
+                    currentNamespace = item.Namespace;
+                    writer.WriteLine(
 $@"namespace {currentNamespace}
 {{");
-                    }
+                }
 
-                    if (!string.IsNullOrEmpty(item.CloseApi))
+                if (!string.IsNullOrEmpty(item.CloseApi))
+                {
+                    writer.WriteLine($"    [RAIIFree(\"{item.CloseApi}\")]");
+                }
+
+                if (!string.IsNullOrEmpty(item.AlsoUsableFor))
+                {
+                    writer.WriteLine($"    [AlsoUsableFor(\"{item.AlsoUsableFor}\")]");
+                }
+
+                if (item.InvalidHandleValues != null)
+                {
+                    foreach (var invalidHandle in item.InvalidHandleValues)
                     {
-                        writer.WriteLine($"    [RAIIFree(\"{item.CloseApi}\")]");
+                        writer.WriteLine($"    [InvalidHandleValue({invalidHandle})]");
                     }
+                }
 
-                    if (!string.IsNullOrEmpty(item.AlsoUsableFor))
-                    {
-                        writer.WriteLine($"    [AlsoUsableFor(\"{item.AlsoUsableFor}\")]");
-                    }
-
-                    writer.WriteLine(
+                writer.WriteLine(
 $@"    [NativeTypedef]    
     public {safety}struct {item.Name}
     {{
         public {valueType} Value;
     }}
 ");
-                }
-
-                if (currentNamespace != null)
-                {
-                    writer.WriteLine("}");
-                }
             }
-        }
 
-        private static string ConvertLinesToCsvString(IEnumerable<string> items)
-        {
-            StringWriter writer = new StringWriter();
-            writer.WriteLine("Namespace,Name,ValueType,CloseApi,AlsoUsableFor");
-            foreach (var line in items)
+            if (currentNamespace != null)
             {
-                writer.WriteLine(line);
+                writer.WriteLine("}");
             }
-
-            return writer.ToString();
-        }
-
-        private class AutoType
-        {
-            public string Namespace { get; set; }
-            public string Name { get; set; }
-            public string ValueType { get; set; }
-            public string CloseApi { get; set; }
-            public string AlsoUsableFor { get; set; }
         }
     }
 }

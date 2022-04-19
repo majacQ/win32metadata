@@ -1,10 +1,12 @@
 ﻿//#define MakeSingleThreaded
+//#define ShowMemoryInfo
 
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -25,6 +27,99 @@ namespace ClangSharpSourceToWinmd
 
         public CSharpCompilation CSharpCompilation => this.compilation;
 
+        internal static void ShowMemory()
+        {
+#if ShowMemoryInfo
+            MEMORYSTATUSEX mem = new MEMORYSTATUSEX();
+            if (GlobalMemoryStatusEx(mem))
+            {
+                double max = ConvertToGB(mem.ullTotalPhys);
+                double avail = ConvertToGB(mem.ullAvailPhys);
+                Console.WriteLine($"RAM avail = {avail}, load = {mem.dwMemoryLoad}");
+            }
+
+            static double ConvertToGB(ulong val)
+            {
+                return (double)val / (1024 * 1024 * 1024);
+            }
+#endif
+        }
+
+        private static void WriteTree(SyntaxTree tree, string fileName)
+        {
+            var dir = Path.GetDirectoryName(fileName);
+            if (!Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            using (StreamWriter writer = File.CreateText(fileName))
+            {
+                tree.GetText().Write(writer);
+            }
+        }
+
+        private static SyntaxTree ReadTree(string fileName)
+        {
+            return CSharpSyntaxTree.ParseText(File.ReadAllText(fileName), null, fileName);
+        }
+
+        private static IEnumerable<SyntaxTree> FilesToTrees(IEnumerable<string> files)
+        {
+            foreach (string file in files)
+            {
+                yield return ReadTree(file);
+            }
+        }
+
+        private static Windows.Win32.Interop.Architecture GetArchitectureForFileName(string fileName)
+        {
+            string potentialArch = Path.GetFileName(Path.GetDirectoryName(fileName));
+
+            switch (potentialArch)
+            {
+                case "x64":
+                    return Windows.Win32.Interop.Architecture.X64;
+
+                case "x86":
+                    return Windows.Win32.Interop.Architecture.X86;
+
+                case "arm64":
+                    return Windows.Win32.Interop.Architecture.Arm64;
+
+                default:
+                    return Windows.Win32.Interop.Architecture.None;
+            }
+        }
+
+        private static CrossArchSyntaxMap LoadCrossArchMapFromFiles(IEnumerable<string> files, System.Threading.Tasks.ParallelOptions parallelOptions)
+        {
+            CrossArchSyntaxMap crossArchSyntaxMap = new CrossArchSyntaxMap();
+
+            var nonx86Files = files.Where(f => GetArchitectureForFileName(f) == Windows.Win32.Interop.Architecture.X64 || GetArchitectureForFileName(f) == Windows.Win32.Interop.Architecture.Arm64);
+            var x86Files = files.Where(f => GetArchitectureForFileName(f) == Windows.Win32.Interop.Architecture.X86);
+
+            // Add non-x86 first so that x86 has a chance to see if it can merge structs not marked
+            // with 4-byte packing with 64-bit versions that are marked. The default packing is 4
+            // for x86 so we can merge these types of structs
+            System.Threading.Tasks.Parallel.ForEach(FilesToTrees(nonx86Files), parallelOptions, (tree) =>
+            {
+                crossArchSyntaxMap.AddTree(tree);
+            });
+
+            System.Threading.Tasks.Parallel.ForEach(FilesToTrees(x86Files), parallelOptions, (tree) =>
+            {
+                crossArchSyntaxMap.AddTree(tree);
+            });
+
+            return crossArchSyntaxMap;
+        }
+
+        private static string GetPartitionNameFromFileName(string fileName)
+        {
+            return Path.GetFileName(fileName).Replace(".modified.cs", string.Empty);
+        }
+
         public static ClangSharpSourceCompilation Create(
             string sourceDirectory,
             string arch,
@@ -35,9 +130,19 @@ namespace ClangSharpSourceToWinmd
             Dictionary<string, string> typeImports,
             Dictionary<string, string> requiredNamespaces,
             HashSet<string> reducePointerLevels,
-            IEnumerable<string> addedRefs)
+            IEnumerable<string> addedRefs,
+            Dictionary<string, string> staticLibs)
         {
             sourceDirectory = Path.GetFullPath(sourceDirectory);
+
+            string topObjDir = Path.Combine(sourceDirectory, $"obj");
+            if (Directory.Exists(topObjDir))
+            {
+                Directory.Delete(topObjDir, true);
+            }
+
+            string objDir = Path.Combine(topObjDir, arch);
+            Directory.CreateDirectory(objDir);
 
             var netstandardPath = FindNetstandardDllPath();
             if (!File.Exists(netstandardPath))
@@ -57,38 +162,21 @@ namespace ClangSharpSourceToWinmd
                 }
             }
 
-            List<SyntaxTree> syntaxTrees = new List<SyntaxTree>();
+            TreeInfoFinder infoFinder = new TreeInfoFinder();
+
+            List<string> modifiedFiles = new List<string>();
             var sourceFiles = Directory.GetFiles(sourceDirectory, "*.cs", SearchOption.AllDirectories).Where(f => IsValidCsSourceFile(f, arch));
-            System.Threading.Tasks.ParallelOptions opt = new System.Threading.Tasks.ParallelOptions() { MaxDegreeOfParallelism = Environment.ProcessorCount * 2 };
-            System.Threading.Tasks.Parallel.ForEach(sourceFiles, opt, (sourceFile) =>
-            {
-                string fileToRead = Path.GetFullPath(sourceFile);
-                var tree = CSharpSyntaxTree.ParseText(File.ReadAllText(fileToRead), null, fileToRead);
-
-                lock (syntaxTrees)
-                {
-                    syntaxTrees.Add(tree);
-                }
-            });
-
-            syntaxTrees = NamesToCorrectNamespacesMover.MoveNamesToCorrectNamespaces(syntaxTrees, requiredNamespaces);
-
-            GetTreeInfo(syntaxTrees, out var emptyStucts, out var enumMemberNames);
+            System.Threading.Tasks.ParallelOptions opt = new System.Threading.Tasks.ParallelOptions();
 
 #if MakeSingleThreaded
             opt.MaxDegreeOfParallelism = 1;
 #endif
 
-            string objDir = Path.Combine(sourceDirectory, $"obj\\{arch}");
-            Directory.CreateDirectory(objDir);
-
-            HashSet<string> enumsMakeFlagsHashSet = enumsMakeFlags != null ? new HashSet<string>(enumsMakeFlags) : new HashSet<string>();
-            List<SyntaxTree> cleanedTrees = new List<SyntaxTree>();
-            System.Threading.Tasks.Parallel.ForEach(syntaxTrees, opt, (tree) =>
+            foreach (string file in sourceFiles)
             {
                 // Turn c:\dir\generated\foo.cs into c:\dir\generated\obj\foo.modified.cs
 
-                string modifiedFile = Path.ChangeExtension(tree.FilePath, ".modified.cs");
+                string modifiedFile = Path.ChangeExtension(file, ".modified.cs");
                 string fileWithSubDir = modifiedFile.Substring(sourceDirectory.Length);
                 if (fileWithSubDir.StartsWith('\\'))
                 {
@@ -97,39 +185,140 @@ namespace ClangSharpSourceToWinmd
 
                 modifiedFile = Path.Combine(objDir, fileWithSubDir);
 
-                // e.g. c:\dir\generated\obj
-                string newSubDir = Path.GetDirectoryName(modifiedFile);
-                if (!Directory.Exists(newSubDir))
+                var dir = Path.GetDirectoryName(modifiedFile);
+                if (!Directory.Exists(dir))
                 {
-                    Directory.CreateDirectory(newSubDir);
+                    Directory.CreateDirectory(dir);
                 }
 
-                var cleanedTree = MetadataSyntaxTreeCleaner.CleanSyntaxTree(tree, remaps, enumAdditions, enumsMakeFlagsHashSet, requiredNamespaces, emptyStucts, enumMemberNames, modifiedFile);
+                File.Copy(file, modifiedFile, true);
+                modifiedFiles.Add(modifiedFile);
+            }
 
-                lock (cleanedTrees)
+            System.Diagnostics.Stopwatch watch = System.Diagnostics.Stopwatch.StartNew();
+
+            Console.WriteLine($"  Moving names to correct namespaces...");
+            System.Threading.Tasks.Parallel.ForEach(modifiedFiles, opt, (treeFile) =>
+            {
+                if (!treeFile.EndsWith(".manual.cs"))
                 {
-                    cleanedTrees.Add(cleanedTree);
+                    var tree = ReadTree(treeFile);
+                    tree = NamesToCorrectNamespacesMover.MoveNamesToCorrectNamespaces(tree, requiredNamespaces);
+
+                    infoFinder.AnalyzeTree(tree);
+
+                    WriteTree(tree, treeFile);
                 }
             });
 
+            var elapsed = watch.Elapsed;
+            Console.WriteLine($"  {OutputUtils.FormatTimespan(elapsed)}");
+
+            ShowMemory();
+
+            Console.WriteLine($"  Cleaning syntax trees...");
+
+            watch.Restart();
+
+            HashSet<string> enumsMakeFlagsHashSet = enumsMakeFlags != null ? new HashSet<string>(enumsMakeFlags) : new HashSet<string>();
+            System.Threading.Tasks.Parallel.ForEach(FilesToTrees(modifiedFiles), opt, (tree) =>
+            {
+                var cleanedTree = MetadataSyntaxTreeCleaner.CleanSyntaxTree(tree, remaps, enumAdditions, enumsMakeFlagsHashSet, requiredNamespaces, staticLibs, infoFinder.EmptyStructs, infoFinder.EnumMemberNames, tree.FilePath);
+                WriteTree(cleanedTree, cleanedTree.FilePath);
+            });
+
+            Console.WriteLine($"  {OutputUtils.FormatTimespan(watch.Elapsed)}");
+            ShowMemory();
+
             if (arch == "crossarch")
             {
-                CrossArchSyntaxMap crossArchSyntaxMap = CrossArchSyntaxMap.LoadFromTrees(cleanedTrees);
-                cleanedTrees = CrossArchTreeMerger.MergeTrees(crossArchSyntaxMap, cleanedTrees);
+                List<string> partitionsNotNeedingCrossarch = new List<string>();
+
+                Console.WriteLine($"  Merging cross-arch items...");
+                watch.Restart();
+
+                List<string> filesToMerge = new List<string>();
+                foreach (string x64FileName in modifiedFiles.Where(f => GetArchitectureForFileName(f) == Windows.Win32.Interop.Architecture.X64))
+                {
+                    string x86FileName = x64FileName.Replace(@"\x64\", @"\x86\", StringComparison.OrdinalIgnoreCase);
+                    string arm64FileName = x64FileName.Replace(@"\x64\", @"\arm64\", StringComparison.OrdinalIgnoreCase);
+
+                    if (File.Exists(x86FileName) && File.Exists(arm64FileName))
+                    {
+                        string x64Content = File.ReadAllText(x64FileName);
+                        if (x64Content == File.ReadAllText(x86FileName) && x64Content == File.ReadAllText(arm64FileName))
+                        {
+                            var parititionName = GetPartitionNameFromFileName(x64FileName);
+
+                            File.Delete(x86FileName);
+                            File.Delete(arm64FileName);
+
+                            partitionsNotNeedingCrossarch.Add(GetPartitionNameFromFileName(x64FileName));
+                        }
+                        else
+                        {
+                            filesToMerge.Add(x64FileName);
+                            filesToMerge.Add(x86FileName);
+                            filesToMerge.Add(arm64FileName);
+                        }
+                    }
+                }
+
+                CrossArchSyntaxMap crossArchSyntaxMap = LoadCrossArchMapFromFiles(filesToMerge, opt);
+
+                CrossArchTreeMerger crossArchTreeMerger = new CrossArchTreeMerger(crossArchSyntaxMap);
+                System.Threading.Tasks.Parallel.ForEach(FilesToTrees(filesToMerge.Where(f => GetArchitectureForFileName(f) == Windows.Win32.Interop.Architecture.X64)), opt, (x64Tree) =>
+                {
+                    string x86FileName = x64Tree.FilePath.Replace(@"\x64\", @"\x86\", StringComparison.OrdinalIgnoreCase);
+                    string arm64FileName = x64Tree.FilePath.Replace(@"\x64\", @"\arm64\", StringComparison.OrdinalIgnoreCase);
+
+                    var parititionName = GetPartitionNameFromFileName(x64Tree.FilePath);
+
+                    var fixed64Tree = crossArchTreeMerger.ProcessTree(x64Tree, out _);
+                    var fixed86Tree = crossArchTreeMerger.ProcessTree(ReadTree(x86FileName), out bool x86Contributed);
+                    var fixedArm64Tree = crossArchTreeMerger.ProcessTree(ReadTree(arm64FileName), out bool arm64Contributed);
+
+                    if (!x86Contributed && SyntaxUtils.IsTreeEmpty(fixed86Tree) &&
+                         !arm64Contributed & SyntaxUtils.IsTreeEmpty(fixedArm64Tree))
+                    {
+                        File.Delete(x86FileName);
+                        File.Delete(arm64FileName);
+
+                        partitionsNotNeedingCrossarch.Add(GetPartitionNameFromFileName(parititionName));
+                    }
+                    else
+                    {
+                        WriteTree(fixed86Tree, fixed86Tree.FilePath);
+                        WriteTree(fixedArm64Tree, fixedArm64Tree.FilePath);
+                    }
+
+                    WriteTree(fixed64Tree, fixed64Tree.FilePath);
+                });
+
+                if (partitionsNotNeedingCrossarch.Count != 0)
+                {
+                    string partInfo = string.Join(',', partitionsNotNeedingCrossarch.ToArray());
+
+                    Console.WriteLine($"ClangSharpSourceToWinmd : warning CSSW001: Partitions detected with no cross-arch differences: {partInfo}");
+                }
+
+                Console.WriteLine($"  {OutputUtils.FormatTimespan(watch.Elapsed)}");
+                ShowMemory();
             }
 
-            foreach (var cleanedTree in cleanedTrees)
-            {
-                File.WriteAllText(cleanedTree.FilePath, cleanedTree.GetText().ToString());
-            }
+            Console.WriteLine($"  Creating C# compilation on processed syntax trees...");
+            watch.Restart();
 
             CSharpCompilationOptions compilationOptions = new CSharpCompilationOptions(OutputKind.WindowsRuntimeMetadata, allowUnsafe: true);
             var comp =
                 CSharpCompilation.Create(
                     null,
-                    cleanedTrees,
+                    FilesToTrees(modifiedFiles.Where(f => File.Exists(f))),
                     refs,
                     compilationOptions);
+
+            Console.WriteLine($"  {OutputUtils.FormatTimespan(watch.Elapsed)}");
+            ShowMemory();
 
             return new ClangSharpSourceCompilation(comp, typeImports);
         }
@@ -177,7 +366,7 @@ namespace ClangSharpSourceToWinmd
                     if (match.Success)
                     {
                         var symbolName = match.Groups[1].Value;
-                        if (this.typeImports.ContainsKey(symbolName) || typeImports.ContainsKey($"{symbolName}(interface)"))
+                        if (this.typeImports.ContainsKey(symbolName) || this.typeImports.ContainsKey($"{symbolName}(interface)"))
                         {
                             continue;
                         }
@@ -192,7 +381,7 @@ namespace ClangSharpSourceToWinmd
 
         private static bool IsValidCsSourceFile(string fileName, string arch)
         {
-            if (fileName.EndsWith("modified.cs"))
+            if (fileName.EndsWith(".modified.cs"))
             {
                 return false;
             }
@@ -202,11 +391,6 @@ namespace ClangSharpSourceToWinmd
             {
                 if (arch == "crossarch")
                 {
-                    if (potentialArch != "x64" && (fileName.EndsWith("autotypes.cs") || fileName.EndsWith(".enums.cs") || fileName.EndsWith(".constants.cs")))
-                    {
-                        return false;
-                    }
-
                     return true;
                 }
                 else
@@ -225,31 +409,53 @@ namespace ClangSharpSourceToWinmd
             return Path.Combine(progFiles, @"dotnet\packs\NETStandard.Library.Ref\2.1.0\ref\netstandard2.1\netstandard.dll");
         }
 
-        private static void GetTreeInfo(List<SyntaxTree> trees, out HashSet<string> emptyStructs, out HashSet<string> enumMemberNames)
+#if ShowMemoryInfo
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+        private class MEMORYSTATUSEX
         {
-            emptyStructs = new HashSet<string>();
-            enumMemberNames = new HashSet<string>();
-            foreach (var tree in trees)
+            public uint dwLength;
+            public uint dwMemoryLoad;
+            public ulong ullTotalPhys;
+            public ulong ullAvailPhys;
+            public ulong ullTotalPageFile;
+            public ulong ullAvailPageFile;
+            public ulong ullTotalVirtual;
+            public ulong ullAvailVirtual;
+            public ulong ullAvailExtendedVirtual;
+            public MEMORYSTATUSEX()
             {
-                TreeInfoFinder finder = new TreeInfoFinder(emptyStructs, enumMemberNames, tree);
+                this.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
             }
         }
 
+        [return: MarshalAs(UnmanagedType.Bool)]
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX lpBuffer);
+#endif
+
         private class TreeInfoFinder : CSharpSyntaxWalker
         {
-            private HashSet<string> emptyStructs;
-            private HashSet<string> enumMemberNames;
-
-            public TreeInfoFinder(HashSet<string> emptyStructs, HashSet<string> enumMemberNames, SyntaxTree tree)
+            public TreeInfoFinder()
             {
-                this.emptyStructs = emptyStructs;
-                this.enumMemberNames = enumMemberNames;
+            }
+
+            public HashSet<string> EmptyStructs { get; } = new HashSet<string>();
+
+            public HashSet<string> EnumMemberNames { get; } = new HashSet<string>();
+
+
+            public void AnalyzeTree(SyntaxTree tree)
+            {
                 this.Visit(tree.GetRoot());
             }
 
             public override void VisitEnumMemberDeclaration(EnumMemberDeclarationSyntax node)
             {
-                this.enumMemberNames.Add(node.Identifier.ValueText);
+                lock (this.EnumMemberNames)
+                {
+                    this.EnumMemberNames.Add(node.Identifier.ValueText);
+                }
+
                 base.VisitEnumMemberDeclaration(node);
             }
 
@@ -257,7 +463,10 @@ namespace ClangSharpSourceToWinmd
             {
                 if (!SyntaxUtils.IsEmptyStruct(node))
                 {
-                    this.emptyStructs.Add(node.Identifier.ValueText);
+                    lock (this.EmptyStructs)
+                    {
+                        this.EmptyStructs.Add(node.Identifier.ValueText);
+                    }
                 }
             }
         }

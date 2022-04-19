@@ -13,35 +13,39 @@ namespace ClangSharpSourceToWinmd
 {
     public class CrossArchTreeMerger
     {
-        public static List<SyntaxTree> MergeTrees(CrossArchSyntaxMap map, List<SyntaxTree> trees)
+        private readonly CrossArchSyntaxMap map;
+        private readonly HashSet<string> crossArchVisitedNames = new HashSet<string>();
+
+        public CrossArchTreeMerger(CrossArchSyntaxMap map)
         {
-            List<SyntaxTree> ret = new List<SyntaxTree>();
-            CrossArchTreeRewriter archTreeRewriter = new CrossArchTreeRewriter(map);
-            foreach (var tree in trees)
-            {
-                var fixedTree = archTreeRewriter.ProcessTree(tree);
+            this.map = map;
+        }
 
-                if (fixedTree != null)
-                {
-                    ret.Add(fixedTree);
-                }
-            }
-
-            return ret;
+        public SyntaxTree ProcessTree(SyntaxTree tree, out bool contributedToNonCommonTree)
+        {
+            return CrossArchTreeRewriter.ProcessTree(this, tree, out contributedToNonCommonTree);
         }
 
         private class CrossArchTreeRewriter : CSharpSyntaxRewriter
         {
-            private CrossArchSyntaxMap map;
             private Architecture currentArch;
-            private HashSet<string> crossArchVisitedNames = new HashSet<string>();
+            private CrossArchTreeMerger owner;
+            private bool contributedToNonCommonTree;
 
-            public CrossArchTreeRewriter(CrossArchSyntaxMap map)
+            private CrossArchTreeRewriter(CrossArchTreeMerger owner)
             {
-                this.map = map;
+                this.owner = owner;
             }
 
-            public SyntaxTree ProcessTree(SyntaxTree tree)
+            public static SyntaxTree ProcessTree(CrossArchTreeMerger owner, SyntaxTree tree, out bool contributedToNonCommonTree)
+            {
+                CrossArchTreeRewriter treeWriter = new CrossArchTreeRewriter(owner);
+                tree = treeWriter.ProcessTree(tree);
+                contributedToNonCommonTree = treeWriter.contributedToNonCommonTree;
+                return tree;
+            }
+
+            private SyntaxTree ProcessTree(SyntaxTree tree)
             {
                 this.currentArch = CrossArchSyntaxMap.GetArchForTree(tree);
 
@@ -109,7 +113,7 @@ namespace ClangSharpSourceToWinmd
                     var originalName = node.Identifier.ValueText;
                     var name = originalName;
 
-                    HandleArchSpecific(node, out var removeNode, out var attributeList, ref name);
+                    this.HandleArchSpecific(node, out var removeNode, out var attributeList, ref name);
                     
                     if (removeNode)
                     {
@@ -139,7 +143,7 @@ namespace ClangSharpSourceToWinmd
                 {
                     var originalName = node.Identifier.ValueText;
                     var name = originalName;
-                    HandleArchSpecific(node, out var removeNode, out var attributeList, ref name);
+                    this.HandleArchSpecific(node, out var removeNode, out var attributeList, ref name);
                     if (removeNode)
                     {
                         return null;
@@ -168,7 +172,7 @@ namespace ClangSharpSourceToWinmd
                 {
                     var originalName = node.Identifier.ValueText;
                     var name = originalName;
-                    HandleArchSpecific(node, out var removeNode, out var attributeList, ref name);
+                    this.HandleArchSpecific(node, out var removeNode, out var attributeList, ref name);
                     if (removeNode)
                     {
                         return null;
@@ -235,7 +239,7 @@ namespace ClangSharpSourceToWinmd
 
             private void HandleArchSpecific(SyntaxNode node, out bool removeNode, out AttributeListSyntax attributeList, ref string name)
             {
-                var archGroupings = this.map.GetSignatureArchGroupings(node).ToArray();
+                var archGroupings = this.owner.map.GetSignatureArchGroupings(node).ToArray();
 
                 attributeList = null;
                 removeNode = false;
@@ -255,13 +259,20 @@ namespace ClangSharpSourceToWinmd
 
                     if (archGroup.HasFlag(this.currentArch))
                     {
-                        var fullNameWithArch = GetFullNameWithArch(node, archGroup);
+                        this.contributedToNonCommonTree = true;
 
-                        // If we've already visited it via another arch, get rid of this one
-                        if (this.crossArchVisitedNames.Contains(fullNameWithArch))
+                        var fullNameWithArch = this.GetFullNameWithArch(node, archGroup);
+
+                        lock (this.owner)
                         {
-                            removeNode = true;
-                            return;
+                            // If we've already visited it via another arch, get rid of this one
+                            if (this.owner.crossArchVisitedNames.Contains(fullNameWithArch))
+                            {
+                                removeNode = true;
+                                return;
+                            }
+
+                            this.owner.crossArchVisitedNames.Add(fullNameWithArch);
                         }
 
                         if (i != 0)
@@ -277,8 +288,6 @@ namespace ClangSharpSourceToWinmd
                                     SyntaxFactory.Attribute(
                                         SyntaxFactory.ParseName("SupportedArchitecture"),
                                         SyntaxFactory.ParseAttributeArgumentList(attributeArgs))));
-
-                        this.crossArchVisitedNames.Add(fullNameWithArch);
 
                         return;
                     }

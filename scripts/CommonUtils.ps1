@@ -1,18 +1,32 @@
-$defaultWinSDKNugetVersion = "10.0.19041.5"
-
 $rootDir = [System.IO.Path]::GetFullPath("$PSScriptRoot\..")
 $toolsDir = "$rootDir\tools"
 $binDir = "$rootDir\bin"
 $sourcesDir = "$rootDir\sources"
-$generationDir = "$rootDir\generation"
-$scraperDir = "$generationDir\scraper"
-$emitterDir = "$generationDir\emitter"
-$partitionsDir = "$scraperDir\Partitions"
 $sdkApiPath = "$rootDir\ext\sdk-api"
-$sdkGeneratedSourceDir = "$emitterDir\generated"
-$artifactsDir = "$scraperDir\obj"
-$recompiledIdlHeadersDir = "$artifactsDir\RecompiledIdlHeaders"
-$metadataToolsBin = "$binDir\release\netcoreapp3.1"
+$windowsWin32ProjectRoot = "$rootDir\generation\WinSDK"
+$sdkGeneratedSourceDir = "$windowsWin32ProjectRoot\obj\generated"
+$recompiledIdlHeadersDir = "$windowsWin32ProjectRoot\RecompiledIdlHeaders"
+$metadataToolsBin = "$binDir\release\net5.0"
+
+# [VS 1673159]
+# Temporarily disable strict mode to address bug introduced
+# in Visual Studio 17.1.0 that impacts vsdevshell launch
+#
+# Set-StrictMode -Version Latest
+
+$ErrorActionPreference = "Stop"
+
+# This messes up parallel loops
+#$PSDefaultParameterValues['*:ErrorAction']='Stop'
+
+function ThrowOnNativeProcessError
+{
+    if (-not $?)
+    {   
+        $var = $?
+        throw "Call to process exited with error"
+    }
+}
 
 if (Test-Path -Path $binDir -PathType leaf)
 {
@@ -24,17 +38,17 @@ if (!(Test-Path -Path $binDir))
     New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 }
 
-function Create-Directory([string[]] $Path) 
+function Create-Directory([string[]] $Path)
 {
-    if (!(Test-Path -Path $Path)) 
+    if (!(Test-Path -Path $Path))
     {
         New-Item -Path $Path -Force -ItemType "Directory" | Out-Null
     }
 }
 
-function Remove-Directory([string[]] $Path) 
+function Remove-Directory([string[]] $Path)
 {
-    if ((Test-Path -Path $Path)) 
+    if ((Test-Path -Path $Path))
     {
         Remove-Item $Path -Recurse
     }
@@ -46,16 +60,16 @@ function Install-DotNetTool
 
     if ($Version -ne '')
     {
-        $installed = & dotnet tool list -g | select-string "$Name\s+$Version"
-        if (!$installed.Length)
+        $installed = & dotnet tool list -g | select-string -Pattern "$Name\s+$Version" -Raw
+        if (($installed -eq $null) -or !$installed.Length)
         {
             & dotnet tool update --global $Name --version $Version
         }
     }
     else
     {
-        $installed = & dotnet tool list -g | select-string "$Name"
-        if (!$installed.Length)
+        $installed = & dotnet tool list -g | select-string -Pattern "$Name" -Raw
+        if (($installed -eq $null) -or !$installed.Length)
         {
             & dotnet tool update --global $Name
         }
@@ -64,10 +78,20 @@ function Install-DotNetTool
 
 function Install-BuildTools
 {
+    Param([switch]$Clean)
+
     Install-DotNetTool -Name ClangSharpPInvokeGenerator -Version 11.0.0-beta3
     Install-DotNetTool -Name nbgv
 
-    & dotnet build "$rootDir\BuildTools\BuildTools.proj" -c Release
+    if ($Clean.IsPresent)
+    {
+        & dotnet clean "$rootDir\buildtools"
+    }
+
+    & dotnet build "$rootDir\buildtools" -c Release
+    ThrowOnNativeProcessError
+
+    Install-VsDevShell
 }
 
 function Replace-Text
@@ -79,33 +103,35 @@ function Replace-Text
     {
         $content = $content.Replace($key, $items[$key]);
     }
-    
+
     Set-Content -path $path -Encoding UTF8 -value $content
 }
 
 function Get-LibMappingsFile
 {
-    $libMappingOutputFileName = Join-Path -Path $scraperDir -ChildPath "libMappings.rsp"
-    
+    $libMappingOutputFileName = Join-Path -Path $windowsWin32ProjectRoot -ChildPath "libMappings.rsp"
+
     return $libMappingOutputFileName
 }
 
-function Get-BuildToolsNugetProps
+function Get-BuildToolsNugetPropsProperty
 {
-    [xml]$buildNugetProps = Get-Content -path "$rootDir\BuildTools\obj\BuildTools.proj.nuget.g.props"
-    return $buildNugetProps;
+    Param ([string] $name)
+
+    $ns = @{xlmns = "http://schemas.microsoft.com/developer/msbuild/2003"}
+    $xpath = "//xlmns:$name"
+    $item = Select-Xml -Path "$rootDir\obj\BuildTools\BuildTools.proj.nuget.g.props" -XPath $xpath -Namespace $ns
+    return $item.node.InnerXml
 }
 
 function Get-WinSdkCppPkgPath
 {
-    [xml]$buildNugetProps = Get-BuildToolsNugetProps
-    return $buildNugetProps.Project.PropertyGroup.PkgMicrosoft_Windows_SDK_CPP.InnerText;
+    return Get-BuildToolsNugetPropsProperty("PkgMicrosoft_Windows_SDK_CPP")
 }
 
 function Get-WinSdkCppX64PkgPath
 {
-    [xml]$buildNugetProps = Get-BuildToolsNugetProps
-    return $buildNugetProps.Project.PropertyGroup.PkgMicrosoft_Windows_SDK_CPP_x64.InnerText;
+    return Get-BuildToolsNugetPropsProperty("PkgMicrosoft_Windows_SDK_CPP_x64")
 }
 
 function Invoke-PrepLibMappingsFile
@@ -113,10 +139,11 @@ function Invoke-PrepLibMappingsFile
     $libMappingOutputFileName = Get-LibMappingsFile
     if (!(Test-Path $libMappingOutputFileName))
     {
-        Write-Output "Creating lib mapping file: $libMappingOutputFileName"
-
         $libPkgPath = Get-WinSdkCppX64PkgPath
         $libDirectory = "$libPkgPath\c\um\x64"
+
+        Write-Output "Creating lib mapping file: $libMappingOutputFileName using $libDirectory"
+
         & $PSScriptRoot\CreateProcLibMappingForAllLibs.ps1 -libDirectory $libDirectory -outputFileName $libMappingOutputFileName
     }
 }
@@ -133,23 +160,6 @@ function Invoke-RecompileMidlHeaders
             return
         }
 
-        Create-Directory $recompiledIdlHeadersDir
-
-        $cppPkgPath = Get-WinSdkCppPkgPath
-        $sdkIncludeDir = (Get-ChildItem -Path "$cppPkgPath\c\include").FullName
-
-        Write-Output "Copying headers from Win SDK...$sdkIncludeDir to $recompiledIdlHeadersDir"
-        copy-item -Path "$sdkIncludeDir\um" -destination "$recompiledIdlHeadersDir" -recurse
-        copy-item -Path "$sdkIncludeDir\shared" -destination "$recompiledIdlHeadersDir" -recurse
-        copy-item -Path "$sdkIncludeDir\winrt" -destination "$recompiledIdlHeadersDir" -recurse
-
-        Write-Output "Recompiling midl headers with SAL annotations in $recompiledIdlHeadersDir"
-        
-        $version = $defaultWinSDKNugetVersion
-        $sdkParts = $version.Split('.')
-        $sdkVersion = "$($sdkParts[0]).$($sdkParts[1]).$($sdkParts[2]).0"
-
-        $sdkBinDir = "$cppPkgPath\c\bin\$sdkVersion\x86"
         & $PSScriptRoot\RecompileIdlFilesForScraping.ps1 -sdkBinDir $sdkBinDir -includeDir $recompiledIdlHeadersDir
 
         Write-Output "Compressing headers to $zipFile..."
@@ -163,13 +173,13 @@ function Get-VcDirPath
 
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
     $installDir = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if ($installDir) 
+    if ($installDir)
     {
         $path = join-path $installDir 'VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt'
-        if (test-path $path) 
+        if (test-path $path)
         {
             $version = Get-Content -raw $path
-            if ($version) 
+            if ($version)
             {
                 $version = $version.Trim()
                 $path = join-path $installDir "VC\Tools\MSVC\$version\bin\Host$HostArch\$Arch"
@@ -179,6 +189,22 @@ function Get-VcDirPath
     }
 
     return $null
+}
+
+function Install-VsDevShell
+{
+    if (!$env:VSINSTALLDIR)
+    {
+        $currentDir = Get-Location
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $installDir = & $vswhere -latest -property installationPath
+    
+        $vsInstallScript = Join-Path $installDir "Common7\Tools\Launch-VsDevShell.ps1"
+    
+        & $vsInstallScript
+    
+        Set-Location $currentDir
+    }
 }
 
 function Get-OutputWinmdFileName
@@ -196,7 +222,7 @@ function Get-OutputWinmdFileName
 
     return $path
 }
-    
+
 function Download-Nupkg
 {
     Param ([string] $name, [string] $version, [string] $outputDir)
@@ -212,7 +238,7 @@ function Get-ExcludedItems
 {
     param ([string[]]$rspFiles)
     [hashtable]$excludedItems = @{}
-    
+
     $inExcluded = $false
     foreach ($rsp in $rspFiles)
     {

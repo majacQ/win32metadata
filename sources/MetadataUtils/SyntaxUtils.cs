@@ -1,10 +1,43 @@
-﻿using Microsoft.CodeAnalysis;
+﻿using System;
+using System.Linq;
+using System.Text.RegularExpressions;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace MetadataUtils
 {
     public static class SyntaxUtils
     {
+        private static readonly Regex vtableSlotRegex = new Regex(@"\(IntPtr\)\(lpVtbl\[(\d+)\]\)");
+
+        public static bool IsTreeEmpty(SyntaxTree tree)
+        {
+            foreach (var node in tree.GetRoot().DescendantNodes())
+            {
+                if (node is StructDeclarationSyntax structNode && !IsEmptyStruct(structNode))
+                {
+                    return false;
+                }
+
+                if (node is ClassDeclarationSyntax classNode && !IsEmptyClass(classNode))
+                {
+                    return false;
+                }
+
+                if (node is DelegateDeclarationSyntax || node is EnumDeclarationSyntax)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public static bool IsEmptyClass(ClassDeclarationSyntax node)
+        {
+            return node.Members.Count == 0;
+        }
+
         public static bool IsEmptyStruct(StructDeclarationSyntax node)
         {
             bool hasNoImportantAttributes =
@@ -12,6 +45,28 @@ namespace MetadataUtils
                 (node.AttributeLists.Count == 1 && node.AttributeLists[0].Attributes[0].Name.ToString() == "SupportedOSPlatform");
 
             return node.Members.Count == 0 && hasNoImportantAttributes;
+        }
+
+        public static SyntaxList<AttributeListSyntax> RemoveAttribute(SyntaxList<AttributeListSyntax> attributeLists, string name)
+        {
+            foreach (var attrList in attributeLists.ToArray())
+            {
+                foreach (var attr in attrList.Attributes)
+                {
+                    if (attr.Name.ToString() == name)
+                    {
+                        attributeLists = attributeLists.Remove(attrList);
+
+                        var newAttrList = attrList.RemoveNode(attr, SyntaxRemoveOptions.KeepNoTrivia);
+                        if (newAttrList.Attributes.Count != 0)
+                        {
+                            attributeLists = attributeLists.Add(newAttrList);
+                        }
+                    }
+                }
+            }
+
+            return attributeLists;
         }
 
         public static AttributeSyntax GetAttribute(SyntaxList<AttributeListSyntax> attributeLists, string name)
@@ -136,6 +191,17 @@ namespace MetadataUtils
         public static string GetFullName(SyntaxNode node)
         {
             return GetFullName(node, false);
+        }
+
+        public static int GetVtableSlotFromMethodBody(MethodDeclarationSyntax method)
+        {
+            var match = vtableSlotRegex.Match(method.Body.ToString());
+            if (match.Success)
+            {
+                return int.Parse(match.Groups[1].Value);
+            }
+
+            throw new InvalidOperationException($"Could not find vtable entry for {method.Parent}.{method.Identifier.ValueText}");
         }
     }
 }

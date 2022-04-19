@@ -2,57 +2,44 @@ param
 (
     [switch]$Clean,
 
+    [switch]$ExcludePackages,
+
+    [switch]$ExcludeSamples,
+
+    [switch]$ExcludeTests,
+
+    [switch]$SkipInstallTools,
+
     [ValidateSet("crossarch", "x64", "x86", "arm64")]
     [string]
     $arch = "crossarch"
 )
 
-. .\scripts\CommonUtils.ps1
+if (!$SkipInstallTools.IsPresent)
+{
+    . .\scripts\CommonUtils.ps1
+
+    Install-BuildTools -Clean:$Clean.IsPresent
+}
 
 if ($Clean.IsPresent)
 {
     .\scripts\CleanOutputs.ps1
 }
 
-Install-BuildTools
+.\scripts\BuildMetadataBin.ps1 -arch $arch -SkipInstallTools
 
-# The libMapings.rsp is checked in as an optimization, but this
-# this will regenerate it if it's not there
-Invoke-PrepLibMappingsFile
-
-if ($arch -eq "crossarch")
+if (!$ExcludePackages)
 {
-    $arches = @("x64", "x86", "arm64")
-
-    foreach ($archItem in $arches)
-    {
-        .\scripts\GenerateMetadataSource.ps1 -arch $archItem
-        if ($LastExitCode -lt 0)
-        {
-            exit $LastExitCode
-        }
-    }
-}
-else
-{
-    .\scripts\GenerateMetadataSource.ps1 -arch $arch
-    if ($LastExitCode -lt 0)
-    {
-        exit $LastExitCode
-    }
+    .\scripts\DoPackages.ps1 -SkipInstallTools
 }
 
-.\scripts\BuildMetadataBin.ps1 -arch $arch
-if ($LastExitCode -lt 0)
+if (!$ExcludeSamples)
 {
-    exit $LastExitCode
+    .\scripts\DoSamples.ps1 -SkipInstallTools
 }
 
-if ($arch -eq "crossarch")
+if (!$ExcludeTests)
 {
-    .\scripts\TestWinmdBinary.ps1
-    if ($LastExitCode -lt 0)
-    {
-        exit $LastExitCode
-    }
+    .\scripts\DoTests.ps1 -SkipInstallTools
 }
